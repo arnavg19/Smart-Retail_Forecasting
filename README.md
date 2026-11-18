@@ -30,19 +30,23 @@ Smart-Retail_Forcasting/
 ├── requirements.txt           # Pinned project dependencies
 └── README.md                  # Enterprise portfolio documentation
 ```
-## Core capabilities
+## 🌟 Core Capabilities & Architectural Pillars
 
-### 1) Data ingestion and expansion
-The data loader removes invalid transaction rows, standardizes items and dates, and creates a complete daily SKU grid so zero-sale days are explicitly represented.
+#### 1. Zero-Inflated Data Ingestion & Grid Expansion (`src/data_loader.py`)
+* **The Problem It Solves:** Retail transaction logs are notoriously sparse, filled with returns, cancellations, and irregular purchasing intervals. 
+* **Our Solution:** An automated ingestion pipeline that strips transactional anomalies, preserves foreign-key integrity, and programmatically constructs a **complete daily SKU grid**—ensuring zero-sale days are explicitly modeled rather than silently dropped.
 
-### 2) Forecasting engine
-The forecasting module uses time-aware validation and includes Tweedie-capable gradient boosting logic for retail demand prediction.
+#### 2. Compound Poisson-Gamma Tweedie Forecasting (`src/train.py`)
+* **The Problem It Solves:** Standard regression (MSE) treats zero sales as continuous noise, while Poisson models suffer from severe underdispersion in volatile retail environments.
+* **Our Solution:** A unified gradient-boosting architecture powered by **LightGBM Tweedie Loss ($p=1.5$)**. This mathematically bridges discrete probability mass at zero with continuous, right-skewed sales volumes in a single, robust training pass under strict chronological splits.
 
-### 3) Dynamic pricing
-The pricing engine estimates demand elasticity and solves the profit-maximization problem using bounded optimization while applying business guardrails.
+#### 3. Elasticity-Driven Dynamic Pricing Engine (`src/pricing_engine.py`)
+* **The Problem It Solves:** Static pricing leads to lost revenue during high-demand surges and excess inventory accumulation during dormant periods.
+* **Our Solution:** A business intelligence layer that estimates **log-log price elasticity** per SKU and solves advanced profit-maximization problems via bounded SciPy optimization, backed by hard operational guardrails.
 
-### 4) Diagnostics
-The system is designed to support SHAP, elasticity analysis, and revenue diagnostics for operational decision-making.
+#### 4. Rigorous MLOps Validation & Explainability (`src/evaluate_features.py`)
+* **The Problem It Solves:** Black-box models fail academic defense and enterprise trust requirements.
+* **Our Solution:** Transparent feature attribution via **gain-based importance extraction**, tracked against zero-safe cumulative metrics (**WAPE**) and volume-scaling error bounds (**RMSLE**), all backed by an automated CI test suite.
 
 ## Quick start
 
