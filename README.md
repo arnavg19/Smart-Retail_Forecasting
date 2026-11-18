@@ -9,29 +9,26 @@ This repository implements an end-to-end AI/ML system for smart retail demand fo
 
 ## Project structure
 
-```text
-smart-retail-pricing/
-├── data/
-│   ├── raw/                       # UCI Online Retail II transactional CSV
-│   └── processed/                 # Daily zero-filled aggregated dataset
+Smart-Retail_Forcasting/
+├── .github/
+│   └── workflows/
+│       └── ci.yml             # Automated GitHub Actions test pipeline
 ├── src/
-│   ├── __init__.py
-│   ├── data_loader.py             # Data ingestion, cleaning, and zero-sales grid setup
-│   ├── features.py                # Lags, rolling statistics, and temporal features
-│   ├── forecasting.py             # LightGBM/XGBoost training with Tweedie loss
-│   └── pricing_engine.py          # Log-Log price elasticity & scipy optimization
-├── notebooks/
-│   ├── 01_data_preprocessing.ipynb
-│   ├── 02_eda_analysis.ipynb
-│   ├── 03_demand_forecasting.ipynb
-│   └── 04_dynamic_pricing.ipynb
-├── reports/
+│   ├── data_loader.py         # Raw data ingestion, anomaly filtering, & schema enforcement
+│   ├── features.py            # Leakage-free feature engineering (EWMA lags, cyclic time)
+│   ├── train.py               # Chronological time-series split & LightGBM Tweedie training
+│   ├── evaluate_features.py   # Gain-based feature importance extraction & plotting
+│   ├── predict.py             # Production inference script with defensive fallback streaming
+│   ├── pricing_engine.py      # Elasticity-based dynamic pricing optimization logic
+│   └── forecasting.py         # Core pipeline orchestration utilities
 ├── tests/
-│   └── test_pipeline.py
-├── requirements.txt
-├── README.md
-└── .gitignore
-```
+│   ├── test_pipeline.py       # Unit tests for data transforms and feature integrity
+│   └── test_train.py          # Model training and artifact serialization tests
+├── models/                    # Serialized model artifacts (.joblib) and feature plots
+├── LICENSE                    # MIT Open Source License
+├── pytest.ini                 # Pytest root path resolution configuration
+├── requirements.txt           # Pinned project dependencies
+└── README.md                  # Enterprise portfolio documentation
 
 ## Core capabilities
 
