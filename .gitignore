@@ -1,0 +1,28 @@
+# Data and generated feature tables
+/data/raw/
+/data/processed/
+*.csv
+*.parquet
+*.xlsx
+*.zip
+
+# Trained models and evaluation outputs
+/models/
+*.joblib
+*.pkl
+*.pickle
+*.png
+
+# Python environments and generated caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Nested working copies
+/Smart-Rertail_Forcasting/
