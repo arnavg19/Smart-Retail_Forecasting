@@ -8,7 +8,7 @@ This repository implements an end-to-end AI/ML system for smart retail demand fo
 - Model explainability and diagnostics
 
 ## Project structure
-
+```text
 Smart-Retail_Forcasting/
 ├── .github/
 │   └── workflows/
@@ -29,7 +29,7 @@ Smart-Retail_Forcasting/
 ├── pytest.ini                 # Pytest root path resolution configuration
 ├── requirements.txt           # Pinned project dependencies
 └── README.md                  # Enterprise portfolio documentation
-
+```
 ## Core capabilities
 
 ### 1) Data ingestion and expansion
