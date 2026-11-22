@@ -31,7 +31,7 @@ PROCESSED_PATHS = (
     DATA_DIR / "processed" / "daily_demand_clean.csv",
 )
 
-app = FastAPI(title="VECTRA Retail Quant System API", version="1.0.0")
+app = FastAPI(title="Smart-Retail Intelligence API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],
