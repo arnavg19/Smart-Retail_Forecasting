@@ -8,3 +8,5 @@ matplotlib>=3.7.0
 pyarrow>=14.0.0
 shap>=0.45.0
 pytest>=8.0.0
+fastapi
+uvicorn[standard]
