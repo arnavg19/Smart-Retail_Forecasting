@@ -83,23 +83,48 @@ creation.
 ## Project Structure
 
 ```text
-Smart-Retail_Forecasting/
-├── .github/workflows/ci.yml
+.
+├── .github/
+│   └── workflows/
+│       └── ci.yml
+├── api/
+│   └── main.py               # FastAPI endpoints for forecasting and pricing
+├── frontend/
+│   ├── src/
+│   │   ├── App.tsx           # Retail analytics dashboard
+│   │   ├── api.ts            # API client and offline demo data
+│   │   ├── index.css         # Tailwind and application styles
+│   │   ├── main.tsx          # React entry point
+│   │   ├── types.ts          # Frontend API types
+│   │   └── vite-env.d.ts     # Vite asset type declarations
+│   ├── .gitignore
+│   ├── index.html
+│   ├── package.json
+│   ├── package-lock.json
+│   ├── postcss.config.js
+│   ├── tailwind.config.js
+│   ├── tsconfig.json
+│   └── vite.config.ts
 ├── src/
-│   ├── data_loader.py       # Data cleaning and daily grid expansion
-│   ├── features.py          # Time-series feature engineering
-│   ├── forecasting.py       # Forecasting and evaluation utilities
-│   ├── train.py             # Model training and serialization
-│   ├── predict.py           # Holdout/test-set inference
-│   ├── pricing_engine.py    # Elasticity and price optimization
-│   └── evaluate_features.py # Feature-importance reporting
+│   ├── data_loader.py        # Data cleaning and daily grid expansion
+│   ├── evaluate_features.py  # Feature-importance reporting
+│   ├── features.py           # Time-series feature engineering
+│   ├── forecasting.py        # Forecasting and evaluation utilities
+│   ├── predict.py            # Holdout/test-set inference
+│   ├── pricing_engine.py     # Elasticity and price optimization
+│   └── train.py              # Model training and serialization
 ├── tests/
-│   ├── test_pipeline.py
-│   └── test_train.py
-├── models/
-├── requirements.txt
-└── README.md
+│   ├── test_pipeline.py      # Data and feature pipeline tests
+│   └── test_train.py         # Training and artifact tests
+├── .gitignore
+├── LICENSE
+├── pytest.ini
+├── README.md
+└── requirements.txt
 ```
+
+Training data, model artifacts, virtual environments, installed dependencies,
+and build output are generated or provided locally and are not committed.
 
 ## Requirements
 
