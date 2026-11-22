@@ -183,6 +183,44 @@ python -m src.train \
   --early-stopping-rounds 100
 ```
 
+## VECTRA web terminal
+
+The decoupled FastAPI bridge (`api/`) exposes portfolio, forecast, pricing, and
+diagnostic endpoints. It prefers the trained artifacts in `models/` and
+processed daily data under `data/processed/`; if no processed table exists, it
+aggregates the raw retail transactions. Without a trained model artifact,
+forecasts use a labeled Poisson live-data baseline and model-specific metrics
+and feature gains remain unavailable. The Vite client (`frontend/`) switches
+to deterministic demonstration data when the API is offline.
+
+Run the API from the repository root:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m uvicorn api.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+In a second terminal:
+
+```powershell
+Set-Location frontend
+npm.cmd install
+npm.cmd run dev
+```
+
+Open `http://localhost:5173`. The API listens at `http://localhost:8000`, with
+interactive documentation at `http://localhost:8000/docs`.
+The frontend requires Node.js LTS. After installing Node on Windows, open a
+new terminal so it receives the updated `PATH`; use `npm.cmd` in PowerShell
+when the execution policy blocks the `npm.ps1` shim.
+
+## Key implementation notes
+
+- Zero-sale expansion is essential because missing values are not the same as true no-demand days.
+- Tweedie loss is appropriate for highly sparse retail demand distributions.
+- Price optimization includes a minimum margin floor and a historical price ceiling to maintain business control.
+- Expanding-window time-series validation prevents leakage between training and testing periods.
+
 Prediction reads `data/processed/test_features.parquet` when available. If
 the file is absent, it falls back to the chronological validation period
 from the daily feature dataset and labels those results as validation
