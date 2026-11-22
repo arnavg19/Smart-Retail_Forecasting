@@ -80,51 +80,82 @@ The project evaluates forecasts with:
 test suite verifies data transformations, model training, and artifact
 creation.
 
-## Project Structure
+## Repository Structure and Architecture
 
 ```text
-.
+Smart-Retail_Forecasting/
 ├── .github/
 │   └── workflows/
-│       └── ci.yml
+│       └── ci.yml                 # Automated test workflow
 ├── api/
-│   └── main.py               # FastAPI endpoints for forecasting and pricing
+│   └── main.py                    # FastAPI application and API endpoints
 ├── frontend/
 │   ├── src/
-│   │   ├── App.tsx           # Retail analytics dashboard
-│   │   ├── api.ts            # API client and offline demo data
-│   │   ├── index.css         # Tailwind and application styles
-│   │   ├── main.tsx          # React entry point
-│   │   ├── types.ts          # Frontend API types
-│   │   └── vite-env.d.ts     # Vite asset type declarations
+│   │   ├── App.tsx                # Dashboard UI
+│   │   ├── api.ts                 # API client and offline demo fallback
+│   │   ├── index.css              # Application styles
+│   │   ├── main.tsx               # React application entry point
+│   │   ├── types.ts               # API response and input types
+│   │   └── vite-env.d.ts          # Vite and asset type declarations
 │   ├── .gitignore
 │   ├── index.html
-│   ├── package.json
+│   ├── package.json               # Frontend scripts and dependencies
 │   ├── package-lock.json
 │   ├── postcss.config.js
 │   ├── tailwind.config.js
 │   ├── tsconfig.json
 │   └── vite.config.ts
-├── src/
-│   ├── data_loader.py        # Data cleaning and daily grid expansion
-│   ├── evaluate_features.py  # Feature-importance reporting
-│   ├── features.py           # Time-series feature engineering
-│   ├── forecasting.py        # Forecasting and evaluation utilities
-│   ├── predict.py            # Holdout/test-set inference
-│   ├── pricing_engine.py     # Elasticity and price optimization
-│   └── train.py              # Model training and serialization
+├── src/                           # Forecasting and pricing pipeline
+│   ├── data_loader.py             # Transaction cleaning and daily aggregation
+│   ├── evaluate_features.py       # Model feature-importance reporting
+│   ├── features.py                # Time-series feature engineering
+│   ├── forecasting.py             # Forecast metrics and evaluation utilities
+│   ├── predict.py                 # Forecast inference
+│   ├── pricing_engine.py          # Elasticity-based price optimization
+│   └── train.py                   # Model training and artifact persistence
 ├── tests/
-│   ├── test_pipeline.py      # Data and feature pipeline tests
-│   └── test_train.py         # Training and artifact tests
+│   ├── test_pipeline.py           # Data and feature pipeline tests
+│   └── test_train.py              # Training and artifact tests
 ├── .gitignore
 ├── LICENSE
 ├── pytest.ini
 ├── README.md
-└── requirements.txt
+└── requirements.txt               # Python dependencies
 ```
 
-Training data, model artifacts, virtual environments, installed dependencies,
-and build output are generated or provided locally and are not committed.
+### Component boundaries
+
+- **Forecasting core (`src/`)** owns data preparation, feature engineering,
+  training, inference, evaluation, and price optimization.
+- **Serving layer (`api/`)** exposes the forecasting and pricing functionality
+  to the client.
+- **Client (`frontend/`)** renders the retail dashboard and communicates with
+  the API; it has a deterministic demo fallback for offline development.
+- **Quality checks (`tests/`, `.github/workflows/`)** provide local and
+  continuous-integration test coverage.
+
+The normal data path is:
+
+```text
+Retail transactions -> data preparation -> features -> training/inference
+                    -> FastAPI -> React dashboard
+```
+
+### Local runtime paths
+
+These paths are created or populated during development and are intentionally
+not part of the tracked source tree:
+
+```text
+(repository root; local only)
+├── data/
+│   ├── raw/        # Input transaction data
+│   └── processed/  # Cleaned daily data and engineered features
+└── models/         # Trained models, metadata, predictions, and plots
+```
+
+Virtual environments, installed frontend dependencies, and frontend build
+output are also local/generated and excluded from version control.
 
 ## Requirements
 
