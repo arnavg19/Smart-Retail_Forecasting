@@ -1,4 +1,4 @@
-# Smart Retail Demand Forecasting and Dynamic Pricing
+# Smart-Retail Intelligence
 
 An end-to-end machine learning system that transforms retail transaction data
 into daily SKU-level demand forecasts and data-driven price recommendations.
@@ -239,7 +239,7 @@ python -m src.train \
   --early-stopping-rounds 100
 ```
 
-## VECTRA web terminal
+## Smart-Retail Intelligence web terminal
 
 The decoupled FastAPI bridge (`api/`) exposes portfolio, forecast, pricing, and
 diagnostic endpoints. It prefers the trained artifacts in `models/` and

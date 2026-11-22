@@ -71,9 +71,9 @@ function Header({ online }: { online: boolean }) {
     <header className="topbar">
       <div className="brand-lockup">
         <div className="brand-glyph"><Command size={17} strokeWidth={2.2} /></div>
-        <span className="brand-name">VECTRA</span>
+        <span className="brand-name">SMART-RETAIL</span>
         <span className="brand-divider" />
-        <span className="brand-product">RETAIL QUANT SYSTEM</span>
+        <span className="brand-product">INTELLIGENCE</span>
       </div>
       <div className="topbar-right">
         <span className="system-time">{new Date().toLocaleDateString("en-US", { month: "short", day: "2-digit", year: "numeric" })}</span>
@@ -724,12 +724,12 @@ export default function App() {
                 <div className="stack-item"><span className="stack-status green" /><span><b>PRICE ENGINE</b><small>LOG-LOG ELASTICITY</small></span></div>
                 <div className="stack-item"><span className={`stack-status ${apiOnline ? "green" : "amber-bg"}`} /><span><b>API BRIDGE</b><small>{apiOnline ? "FASTAPI · CONNECTED" : "DEMO DATA ACTIVE"}</small></span></div>
               </div>
-              <div className="sidebar-user"><div className="user-avatar">V</div><span><b>VECTRA OPS</b><small>QUANT DESK · 01</small></span><ChevronDown size={13} /></div>
+              <div className="sidebar-user"><div className="user-avatar">S</div><span><b>SMART-RETAIL OPS</b><small>INTELLIGENCE DESK · 01</small></span><ChevronDown size={13} /></div>
             </>
           )}
         </aside>
         <main className="main-content">
-          <div className="breadcrumb"><span>VECTRA</span><ChevronRight size={12} /><span>WORKSPACE</span><ChevronRight size={12} /><b><ActiveIcon size={12} />{active?.number} // {active?.label.toUpperCase()}</b></div>
+          <div className="breadcrumb"><span>SMART-RETAIL INTELLIGENCE</span><ChevronRight size={12} /><span>WORKSPACE</span><ChevronRight size={12} /><b><ActiveIcon size={12} />{active?.number} // {active?.label.toUpperCase()}</b></div>
           {payload ? (
             <div className="view-content">
               {apiError && <div className="error-note">{apiError}</div>}
@@ -739,9 +739,9 @@ export default function App() {
               {activeView === "screener" && <ScreenerView skus={payload.skus} results={batchResults} setResults={setBatchResults} />}
             </div>
           ) : (
-            <div className="loading-screen">{apiError ? <span className="error-note">{apiError}</span> : <><LoaderCircle className="spin" /><span>CONNECTING TO VECTRA DATA PLANE</span></>}</div>
+            <div className="loading-screen">{apiError ? <span className="error-note">{apiError}</span> : <><LoaderCircle className="spin" /><span>CONNECTING TO SMART-RETAIL DATA PLANE</span></>}</div>
           )}
-          <footer className="statusbar"><span><i className={apiOnline ? "green-bg" : "amber-bg"} />{apiOnline ? "CONNECTED" : "OFFLINE FALLBACK"}</span><span>VECTRA TERMINAL <b>1.0.0</b></span><span>DEMAND INTELLIGENCE · {new Date().getFullYear()}</span><span className="status-shortcut"><Terminal size={12} /> SYSTEM STATUS: NOMINAL</span></footer>
+          <footer className="statusbar"><span><i className={apiOnline ? "green-bg" : "amber-bg"} />{apiOnline ? "CONNECTED" : "OFFLINE FALLBACK"}</span><span>SMART-RETAIL INTELLIGENCE <b>1.0.0</b></span><span>DEMAND INTELLIGENCE · {new Date().getFullYear()}</span><span className="status-shortcut"><Terminal size={12} /> SYSTEM STATUS: NOMINAL</span></footer>
         </main>
       </div>
     </div>
