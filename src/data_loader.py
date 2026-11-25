@@ -6,6 +6,7 @@ from time import perf_counter
 from pathlib import Path
 from typing import Final
 
+import numpy as np
 import pandas as pd
 
 
@@ -21,13 +22,26 @@ def _clean_column_name(column_name: object) -> str:
     return text.lower()
 
 
-def load_raw_transactions(csv_path: str | Path) -> pd.DataFrame:
+def load_raw_transactions(
+    csv_path: str | Path, *, item_column: str = "StockCode"
+) -> pd.DataFrame:
     """Load the raw UCI Online Retail II CSV with the required legacy encoding."""
     path = Path(csv_path)
     LOGGER.info("Ingestion started from raw data: %s", path)
 
     started_at = perf_counter()
-    df = pd.read_csv(path, encoding="ISO-8859-1", low_memory=False)
+    df = pd.read_csv(
+        path,
+        encoding="ISO-8859-1",
+        dtype={
+            "StockCode": "string",
+            "stockcode": "string",
+            "stock_code": "string",
+            "item_id": "string",
+            item_column: "string",
+        },
+        low_memory=False,
+    )
     if df.empty:
         raise ValueError(f"The source dataset is empty: {path}")
 
@@ -37,9 +51,16 @@ def load_raw_transactions(csv_path: str | Path) -> pd.DataFrame:
     return df
 
 
-def _normalize_retail_columns(df: pd.DataFrame) -> pd.DataFrame:
+def normalize_retail_columns(
+    df: pd.DataFrame,
+    item_column: str = "item_id",
+    date_column: str = "invoice_date",
+    target_column: str = "quantity",
+    price_column: str = "unit_price",
+) -> pd.DataFrame:
     """Standardize column names to the schema required by the ingestion pipeline."""
     normalized = df.copy()
+    normalized.columns = [_clean_column_name(column) for column in normalized.columns]
 
     aliases = {
         "stockcode": "item_id",
@@ -54,8 +75,20 @@ def _normalize_retail_columns(df: pd.DataFrame) -> pd.DataFrame:
         "date": "invoice_date",
     }
 
-    renamed = {column: aliases.get(column, column) for column in normalized.columns}
+    configured_aliases = {
+        _clean_column_name(item_column): "item_id",
+        _clean_column_name(date_column): "invoice_date",
+        _clean_column_name(target_column): "quantity",
+        _clean_column_name(price_column): "unit_price",
+    }
+    renamed = {
+        column: configured_aliases.get(column, aliases.get(column, column))
+        for column in normalized.columns
+    }
     normalized = normalized.rename(columns=renamed)
+    if normalized.columns.duplicated().any():
+        duplicates = sorted(set(normalized.columns[normalized.columns.duplicated()].tolist()))
+        raise ValueError(f"Multiple source columns map to the same retail field: {duplicates}")
 
     if "item_id" not in normalized.columns:
         raise ValueError("The dataset must contain an item identifier column such as StockCode or item_id.")
@@ -69,14 +102,23 @@ def _normalize_retail_columns(df: pd.DataFrame) -> pd.DataFrame:
     return normalized
 
 
-def clean_transactions(df: pd.DataFrame) -> pd.DataFrame:
+def clean_transactions(
+    df: pd.DataFrame,
+    *,
+    item_column: str = "item_id",
+    date_column: str = "invoice_date",
+    target_column: str = "quantity",
+    price_column: str = "unit_price",
+) -> pd.DataFrame:
     """Remove invalid retail rows and keep only valid daily transaction observations."""
     if df is None or df.empty:
         return pd.DataFrame(columns=["item_id", "invoice_date", "quantity", "unit_price", "gross_revenue"])
 
     started_at = perf_counter()
     input_rows = len(df)
-    normalized = _normalize_retail_columns(df)
+    normalized = normalize_retail_columns(
+        df, item_column, date_column, target_column, price_column
+    )
     cleaned = normalized[["item_id", "invoice_date", "quantity", "unit_price"]].copy()
 
     cleaned["item_id"] = cleaned["item_id"].astype("string").str.strip()
@@ -85,10 +127,13 @@ def clean_transactions(df: pd.DataFrame) -> pd.DataFrame:
     cleaned["unit_price"] = pd.to_numeric(cleaned["unit_price"], errors="coerce")
 
     cleaned = cleaned.dropna(subset=["item_id", "invoice_date", "quantity", "unit_price"]).copy()
+    finite_rows = np.isfinite(cleaned["quantity"]) & np.isfinite(cleaned["unit_price"])
+    cleaned = cleaned.loc[finite_rows].copy()
     cleaned = cleaned[cleaned["item_id"].astype(str).str.len() > 0]
     cleaned = cleaned[(cleaned["quantity"] > 0) & (cleaned["unit_price"] > 0)].copy()
     cleaned["invoice_date"] = cleaned["invoice_date"].dt.floor("D")
     cleaned["gross_revenue"] = cleaned["quantity"] * cleaned["unit_price"]
+    cleaned = cleaned.loc[np.isfinite(cleaned["gross_revenue"])].copy()
 
     cleaned = cleaned.sort_values(["item_id", "invoice_date"]).reset_index(drop=True)
     LOGGER.info(
@@ -100,11 +145,42 @@ def clean_transactions(df: pd.DataFrame) -> pd.DataFrame:
     return cleaned
 
 
+def clean_transactions_with_audit(
+    df: pd.DataFrame,
+    *,
+    item_column: str = "item_id",
+    date_column: str = "invoice_date",
+    target_column: str = "quantity",
+    price_column: str = "unit_price",
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    """Clean rows and report observed input, retained, and rejected counts."""
+    input_rows = 0 if df is None else len(df)
+    cleaned = clean_transactions(
+        df,
+        item_column=item_column,
+        date_column=date_column,
+        target_column=target_column,
+        price_column=price_column,
+    )
+    return cleaned, {
+        "input_rows": input_rows,
+        "valid_transaction_rows": len(cleaned),
+        "dropped_invalid_rows": input_rows - len(cleaned),
+        "active_skus": int(cleaned["item_id"].nunique()),
+    }
+
+
 def expand_daily_sales_grid(
     df: pd.DataFrame,
     min_sales: int = 50,
     date_start: str | pd.Timestamp | None = None,
     date_end: str | pd.Timestamp | None = None,
+    *,
+    item_column: str = "item_id",
+    date_column: str = "invoice_date",
+    target_column: str = "quantity",
+    price_column: str = "unit_price",
+    frequency: str = "D",
 ) -> pd.DataFrame:
     """Build a complete daily item-by-date matrix with explicit zero-demand days.
 
@@ -113,7 +189,19 @@ def expand_daily_sales_grid(
     learns that a zero quantity is a real business state rather than a missing observation.
     """
     started_at = perf_counter()
-    cleaned = clean_transactions(df)
+    if min_sales < 1:
+        raise ValueError("min_sales must be at least one valid transaction.")
+    try:
+        pd.tseries.frequencies.to_offset(frequency)
+    except ValueError as error:
+        raise ValueError(f"Unsupported grid frequency: {frequency!r}") from error
+    cleaned = clean_transactions(
+        df,
+        item_column=item_column,
+        date_column=date_column,
+        target_column=target_column,
+        price_column=price_column,
+    )
     if cleaned.empty:
         LOGGER.info("Daily grid expansion completed in %.3f seconds with no valid transactions", perf_counter() - started_at)
         return pd.DataFrame(columns=["item_id", "invoice_date", "quantity", "unit_price", "gross_revenue"])
@@ -123,8 +211,13 @@ def expand_daily_sales_grid(
     if date_end is None:
         date_end = cleaned["invoice_date"].max().floor("D")
 
-    start = pd.Timestamp(date_start).floor("D")
-    end = pd.Timestamp(date_end).floor("D")
+    start = pd.Timestamp(date_start)
+    end = pd.Timestamp(date_end)
+    if start > end:
+        raise ValueError("date_start must not be later than date_end.")
+    cleaned["invoice_date"] = cleaned["invoice_date"].dt.to_period(frequency).dt.start_time
+    start = start.to_period(frequency).start_time
+    end = end.to_period(frequency).start_time
     active_items = (
         cleaned.groupby("item_id", dropna=False)
         .size()
@@ -138,7 +231,7 @@ def expand_daily_sales_grid(
         LOGGER.info("Daily grid expansion completed in %.3f seconds", perf_counter() - started_at)
         return pd.DataFrame(columns=["item_id", "invoice_date", "quantity", "unit_price", "gross_revenue"])
 
-    full_calendar = pd.date_range(start=start, end=end, freq="D")
+    full_calendar = pd.period_range(start=start, end=end, freq=frequency).start_time
     full_grid = pd.MultiIndex.from_product(
         [sorted(active_items), full_calendar],
         names=["item_id", "invoice_date"],
@@ -160,17 +253,23 @@ def expand_daily_sales_grid(
 
     daily_grid["quantity"] = daily_grid["quantity"].fillna(0.0).astype(float)
     daily_grid["unit_price"] = daily_grid.groupby("item_id")["unit_price"].transform(
-        lambda series: series.ffill().bfill()
+        lambda series: series.ffill().fillna(0.0)
     )
     daily_grid["unit_price"] = daily_grid["unit_price"].fillna(0.0)
     daily_grid["gross_revenue"] = daily_grid["quantity"] * daily_grid["unit_price"]
 
     daily_grid = daily_grid.sort_values(["item_id", "invoice_date"]).reset_index(drop=True)
+    zero_sale_rows = int(daily_grid["quantity"].eq(0).sum())
+    zero_sale_grid_rows = max(len(full_grid) - len(demand_by_day), 0)
     LOGGER.info(
-        "Expanded grid: %s SKUs x %s days = %s total rows in %.3f seconds",
+        "Ingestion audit: valid transactions=%s active SKUs=%s calendar periods=%s grid rows=%s "
+        "zero-sale rows=%s zero-sale grid expansions=%s in %.3f seconds",
+        len(cleaned),
         len(active_items),
         len(full_calendar),
         len(full_grid),
+        zero_sale_rows,
+        zero_sale_grid_rows,
         perf_counter() - started_at,
     )
     return daily_grid
@@ -180,6 +279,12 @@ def run_pipeline(
     raw_csv_path: str | Path,
     output_path: str | Path,
     min_sales: int = 50,
+    *,
+    item_column: str = "item_id",
+    date_column: str = "invoice_date",
+    target_column: str = "quantity",
+    price_column: str = "unit_price",
+    frequency: str = "D",
 ) -> pd.DataFrame:
     """Run the full ingestion pipeline and persist the daily demand dataset."""
     raw_path = Path(raw_csv_path)
@@ -187,11 +292,19 @@ def run_pipeline(
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
     started_at = perf_counter()
-    raw_df = load_raw_transactions(raw_path)
+    raw_df = load_raw_transactions(raw_path, item_column=item_column)
     LOGGER.info("Raw ingestion block completed in %.3f seconds", perf_counter() - started_at)
 
     started_at = perf_counter()
-    processed = expand_daily_sales_grid(raw_df, min_sales=min_sales)
+    processed = expand_daily_sales_grid(
+        raw_df,
+        min_sales=min_sales,
+        item_column=item_column,
+        date_column=date_column,
+        target_column=target_column,
+        price_column=price_column,
+        frequency=frequency,
+    )
     LOGGER.info("Daily processing block completed in %.3f seconds", perf_counter() - started_at)
 
     started_at = perf_counter()

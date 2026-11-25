@@ -1,21 +1,29 @@
 from __future__ import annotations
 
+import io
 import json
 import logging
+import time
+from collections import OrderedDict
+from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
 
 import joblib
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from sklearn.linear_model import PoissonRegressor
-
-from src.data_loader import clean_transactions, load_raw_transactions
-from src.evaluate_features import evaluate_feature_importance
-from src.predict import _prepare_model_features, predict_test_set
+from sklearn.linear_model import Ridge
+from src.data_loader import (
+    clean_transactions,
+    clean_transactions_with_audit,
+    expand_daily_sales_grid,
+    load_raw_transactions,
+)
+from src.predict import _prepare_model_features
 from src.pricing_engine import demand_curve, optimize_price
 from src.train import rmsle as compute_rmsle, wape as compute_wape
 
@@ -26,19 +34,110 @@ MODELS_DIR = PROJECT_ROOT / "models"
 MODEL_PATH = MODELS_DIR / "lightgbm_tweedie_model.joblib"
 METADATA_PATH = MODELS_DIR / "lightgbm_tweedie_metadata.json"
 DATA_DIR = PROJECT_ROOT / "data"
-PROCESSED_PATHS = (
-    DATA_DIR / "processed" / "daily_demand_features.csv",
-    DATA_DIR / "processed" / "daily_demand_clean.csv",
-)
+PROCESSED_DIR = DATA_DIR / "processed"
+DAILY_DATA_PATH = PROCESSED_DIR / "daily_demand_clean.csv"
+FEATURE_DATA_PATH = PROCESSED_DIR / "daily_demand_features.csv"
+FEATURE_IMPORTANCE_PATH = MODELS_DIR / "feature_importance.json"
 
-app = FastAPI(title="Smart-Retail Intelligence API", version="1.0.0")
+_feature_data: pd.DataFrame | None = None
+_history_cache: dict[str, pd.DataFrame] = {}
+_forecast_cache: OrderedDict[tuple[str, int], ForecastResponse] = OrderedDict()
+_price_response_cache: OrderedDict[tuple[object, ...], PriceResponse] = OrderedDict()
+_feature_importance_cache: list[FeatureImportance] | None = None
+_sku_catalog_cache: SkuResponse | None = None
+_sku_catalog_json: bytes | None = None
+_screener_cache: ScreenerResponse | None = None
+_screener_json: bytes | None = None
+_diagnostics_cache: DiagnosticsResponse | None = None
+_startup_ready = False
+
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    global _feature_data, _feature_importance_cache, _sku_catalog_cache
+    global _sku_catalog_json, _screener_cache, _screener_json, _diagnostics_cache
+    global _startup_ready
+
+    started = time.perf_counter()
+    _load_daily_data.cache_clear()
+    _load_model.cache_clear()
+    _portfolio_metrics.cache_clear()
+    _history_cache.clear()
+    _forecast_cache.clear()
+    _price_response_cache.clear()
+    _sku_catalog_cache = None
+    _sku_catalog_json = None
+    _screener_cache = None
+    _screener_json = None
+    _diagnostics_cache = None
+    _feature_importance_cache = None
+    _feature_data = None
+    _startup_ready = False
+
+    try:
+        if not DAILY_DATA_PATH.is_file():
+            raise FileNotFoundError(f"Processed retail data not found: {DAILY_DATA_PATH}")
+        if not FEATURE_DATA_PATH.is_file():
+            raise FileNotFoundError(f"Processed feature data not found: {FEATURE_DATA_PATH}")
+
+        daily_data, _ = _load_daily_data()
+        _feature_data = pd.read_csv(
+            FEATURE_DATA_PATH,
+            dtype={"item_id": "string"},
+            low_memory=False,
+        )
+        model, metadata = _load_model()
+        if model is None or metadata is None:
+            raise RuntimeError(
+                f"The trained LightGBM model and metadata are required: {MODEL_PATH}"
+            )
+
+        _warm_history_cache(daily_data)
+        _feature_importance_cache = _load_feature_importance(model)
+        _portfolio_metrics()
+        _sku_catalog_cache = _build_sku_catalog()
+        _sku_catalog_json = _serialize_model(_sku_catalog_cache)
+        _screener_cache = _build_screener_payload(_sku_catalog_cache)
+        _screener_json = _serialize_model(_screener_cache)
+        _diagnostics_cache = get_diagnostics()
+
+        application.state.daily_data = daily_data
+        application.state.feature_data = _feature_data
+        application.state.model = model
+        application.state.metadata = metadata
+        application.state.sku_catalog = _sku_catalog_cache
+        application.state.screener = _screener_cache
+        LOGGER.info(
+            "Smart Retail API warmed: %d SKUs, %d feature rows, startup %.2fs",
+            _sku_catalog_cache.portfolio.total_skus,
+            len(_feature_data),
+            time.perf_counter() - started,
+        )
+        _startup_ready = True
+    except Exception:
+        LOGGER.exception("Smart Retail API startup pre-warming failed")
+        raise
+
+    try:
+        yield
+    finally:
+        _startup_ready = False
+
+
+app = FastAPI(title="Smart-Retail Intelligence API", version="1.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=True,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+
+@app.get("/health", tags=["health"])
+def health_check() -> dict[str, str]:
+    """Report readiness after lifespan data and model pre-warming completes."""
+    return {"status": "ok"}
 
 
 class SkuRecord(BaseModel):
@@ -58,12 +157,20 @@ class PortfolioMetrics(BaseModel):
     zero_sale_rate: float
     data_source: str
     model_available: bool
+    mode: str
 
 
 class SkuResponse(BaseModel):
     portfolio: PortfolioMetrics
     metrics: dict[str, float | None]
     metrics_source: str
+    skus: list[SkuRecord]
+    mode: str
+
+
+class ScreenerResponse(BaseModel):
+    total_skus: int
+    limit: int
     skus: list[SkuRecord]
 
 
@@ -73,8 +180,7 @@ class ForecastPoint(BaseModel):
     prediction: float | None = None
     p10: float | None = None
     p90: float | None = None
-    ols: float | None = None
-    poisson: float | None = None
+    baseline: float | None = None
     zero_sale: bool = False
 
 
@@ -84,6 +190,7 @@ class ForecastResponse(BaseModel):
     model: str
     model_available: bool
     points: list[ForecastPoint]
+    mode: str
 
 
 class PriceRequest(BaseModel):
@@ -92,6 +199,9 @@ class PriceRequest(BaseModel):
     competitor_index: float = Field(gt=0, le=5)
     min_margin_floor: float = Field(ge=0, lt=1)
     max_price_delta_pct: float = Field(gt=0, le=1)
+    inventory: float = Field(ge=0)
+    elasticity: float | None = Field(default=None, ge=0, le=10)
+    strict_bounds: bool = False
 
 
 class ProfitPoint(BaseModel):
@@ -108,6 +218,14 @@ class PriceResponse(BaseModel):
     net_profit_uplift: float
     reference_price: float
     profit_curve: list[ProfitPoint]
+    inventory_cap: float
+    unit_cost: float
+    min_margin_floor: float
+    historical_max_price: float
+    max_price_delta_pct: float
+    elasticity: float
+    elasticity_source: str
+    mode: str
 
 
 class FeatureImportance(BaseModel):
@@ -128,12 +246,89 @@ class DiagnosticsResponse(BaseModel):
     feature_importance: list[FeatureImportance]
     benchmarks: list[Benchmark]
     formula: str
+    mode: str
+    tweedie_variance_power: float | None = None
+
+
+class IngestionResponse(BaseModel):
+    input_rows: int
+    valid_transaction_rows: int
+    dropped_invalid_rows: int
+    active_skus: int
+    calendar_periods: int
+    grid_rows: int
+    zero_sale_rows: int
+    zero_sale_grid_expansion_rows: int
+    preview: list[dict[str, object]]
+    mode: str
+
+
+SCREENER_LIMIT = 500
+
+
+def _serialize_model(value: BaseModel) -> bytes:
+    return json.dumps(
+        value.model_dump(mode="json"),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _warm_history_cache(data: pd.DataFrame) -> None:
+    for sku_id, group in data.groupby("item_id", sort=False, observed=True):
+        history = group[["invoice_date", "quantity", "unit_price"]].copy()
+        history = history.set_index("invoice_date").sort_index()
+        calendar = pd.date_range(history.index.min(), history.index.max(), freq="D")
+        if not history.index.equals(calendar):
+            history = history.reindex(calendar)
+        history.index.name = "invoice_date"
+        history["quantity"] = history["quantity"].fillna(0.0)
+        history["unit_price"] = history["unit_price"].ffill().fillna(0.0)
+        _history_cache[str(sku_id)] = history
+
+
+def _load_feature_importance(model: object) -> list[FeatureImportance]:
+    if FEATURE_IMPORTANCE_PATH.is_file():
+        with FEATURE_IMPORTANCE_PATH.open(encoding="utf-8") as file:
+            payload = json.load(file)
+        if not isinstance(payload, list):
+            raise ValueError(f"Invalid feature-importance JSON: {FEATURE_IMPORTANCE_PATH}")
+        try:
+            return [FeatureImportance.model_validate(row) for row in payload]
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"Invalid feature-importance JSON: {FEATURE_IMPORTANCE_PATH}"
+            ) from error
+
+    booster = getattr(model, "booster_", None)
+    if booster is None:
+        raise TypeError("Trained model does not expose a fitted LightGBM booster.")
+    names = booster.feature_name()
+    gains = booster.feature_importance(importance_type="gain")
+    if len(names) != len(gains) or not names:
+        raise ValueError("Model feature names and gain importances are inconsistent.")
+    ranked = (
+        pd.DataFrame({"feature": names, "gain": gains})
+        .sort_values("gain", ascending=False, kind="mergesort")
+        .head(20)
+    )
+    result = [
+        FeatureImportance(feature=str(row.feature), gain=float(row.gain))
+        for row in ranked.itertuples(index=False)
+    ]
+    FEATURE_IMPORTANCE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    FEATURE_IMPORTANCE_PATH.write_text(
+        json.dumps([row.model_dump(mode="json") for row in result], indent=2),
+        encoding="utf-8",
+    )
+    return result
 
 
 @lru_cache(maxsize=1)
 def _load_daily_data() -> tuple[pd.DataFrame, str]:
     """Load processed pipeline data, falling back to aggregated raw transactions."""
-    for path in PROCESSED_PATHS:
+    for path in (DAILY_DATA_PATH, FEATURE_DATA_PATH):
         if path.is_file():
             frame = pd.read_csv(path, dtype={"item_id": "string"}, low_memory=False)
             required = {"item_id", "invoice_date", "quantity"}
@@ -144,7 +339,7 @@ def _load_daily_data() -> tuple[pd.DataFrame, str]:
                 if "unit_price" not in frame:
                     frame["unit_price"] = 0.0
                 frame["unit_price"] = pd.to_numeric(frame["unit_price"], errors="coerce").fillna(0.0)
-                return _aggregate_daily(frame), path.name
+                return _complete_daily_grid(_aggregate_daily(frame)), path.name
 
     raw_files = sorted((DATA_DIR / "raw").glob("*.csv"))
     if not raw_files:
@@ -152,7 +347,7 @@ def _load_daily_data() -> tuple[pd.DataFrame, str]:
     cleaned = clean_transactions(load_raw_transactions(raw_files[0]))
     if cleaned.empty:
         raise HTTPException(status_code=503, detail="The raw transaction dataset has no valid sales.")
-    return _aggregate_daily(cleaned), "raw transactions"
+    return _complete_daily_grid(_aggregate_daily(cleaned)), "raw transactions"
 
 
 def _aggregate_daily(frame: pd.DataFrame) -> pd.DataFrame:
@@ -171,6 +366,63 @@ def _aggregate_daily(frame: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def _complete_daily_grid(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    start = frame["invoice_date"].min().floor("D")
+    end = frame["invoice_date"].max().floor("D")
+    items = frame["item_id"].drop_duplicates().sort_values()
+    calendar = pd.date_range(start, end, freq="D")
+    grid = pd.MultiIndex.from_product(
+        [items, calendar], names=["item_id", "invoice_date"]
+    ).to_frame(index=False)
+    completed = grid.merge(frame, on=["item_id", "invoice_date"], how="left")
+    completed["quantity"] = completed["quantity"].fillna(0.0)
+    completed["unit_price"] = (
+        completed.groupby("item_id", sort=False)["unit_price"]
+        .transform(lambda prices: prices.ffill().fillna(0.0))
+        .fillna(0.0)
+    )
+    return completed
+
+
+@app.post("/api/ingest", response_model=IngestionResponse)
+async def ingest_csv(
+    request: Request,
+    filename: str = Query(min_length=1, max_length=255),
+) -> IngestionResponse:
+    """Validate, clean, and audit an uploaded CSV without persisting it."""
+    if not filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=415, detail="Only CSV uploads are supported.")
+    content = await request.body()
+    if not content:
+        raise HTTPException(status_code=422, detail="The uploaded CSV is empty.")
+    try:
+        raw = pd.read_csv(io.BytesIO(content), encoding="ISO-8859-1", low_memory=False)
+        cleaned, audit = clean_transactions_with_audit(raw)
+    except (UnicodeError, pd.errors.ParserError, ValueError) as error:
+        raise HTTPException(status_code=422, detail=f"CSV validation failed: {error}") from error
+    if cleaned.empty:
+        raise HTTPException(status_code=422, detail="No valid sales rows remain after cleaning.")
+    daily = expand_daily_sales_grid(
+        cleaned, min_sales=1, date_start=cleaned["invoice_date"].min(),
+        date_end=cleaned["invoice_date"].max(),
+    )
+    observed_periods = int(cleaned[["item_id", "invoice_date"]].drop_duplicates().shape[0])
+    zero_sales = int(daily["quantity"].eq(0).sum())
+    return IngestionResponse(
+        **audit,
+        calendar_periods=int(daily["invoice_date"].nunique()),
+        grid_rows=len(daily),
+        zero_sale_rows=zero_sales,
+        zero_sale_grid_expansion_rows=max(len(daily) - observed_periods, 0),
+        preview=daily.head(20).assign(
+            invoice_date=lambda values: values["invoice_date"].dt.date.astype(str)
+        ).to_dict(orient="records"),
+        mode="live",
+    )
+
+
 @lru_cache(maxsize=1)
 def _load_model() -> tuple[object | None, dict[str, object] | None]:
     if not MODEL_PATH.is_file():
@@ -180,13 +432,34 @@ def _load_model() -> tuple[object | None, dict[str, object] | None]:
         return None, None
     with METADATA_PATH.open(encoding="utf-8") as file:
         metadata = json.load(file)
+    if not _is_daily_artifact(metadata):
+        return None, None
     model = joblib.load(MODEL_PATH)
     if getattr(model, "booster_", None) is None:
         raise RuntimeError(f"Model artifact is not a fitted LightGBM model: {MODEL_PATH}")
     return model, metadata
 
 
+def _is_daily_artifact(metadata: dict[str, object]) -> bool:
+    frequency = metadata.get("frequency", "D")
+    try:
+        normalized_frequency = pd.tseries.frequencies.to_offset(str(frequency)).freqstr
+    except ValueError:
+        LOGGER.warning("Model metadata has an invalid frequency: %r", frequency)
+        return False
+    if normalized_frequency != "D":
+        LOGGER.warning(
+            "The API serves daily forecast horizons only; artifact frequency %r is unsupported.",
+            normalized_frequency,
+        )
+        return False
+    return True
+
+
 def _sku_history(sku_id: str) -> pd.DataFrame:
+    cached = _history_cache.get(sku_id)
+    if cached is not None:
+        return cached
     data, _ = _load_daily_data()
     history = data.loc[data["item_id"].astype(str) == sku_id].copy()
     if history.empty:
@@ -196,7 +469,7 @@ def _sku_history(sku_id: str) -> pd.DataFrame:
     history = history.reindex(calendar)
     history.index.name = "invoice_date"
     history["quantity"] = history["quantity"].fillna(0.0)
-    history["unit_price"] = history["unit_price"].ffill().bfill().fillna(0.0)
+    history["unit_price"] = history["unit_price"].ffill().fillna(0.0)
     return history
 
 
@@ -271,52 +544,83 @@ def _update_calendar_features(row: dict[str, object], date: pd.Timestamp) -> Non
     row.update({key: value for key, value in values.items() if key in row})
 
 
-def _baseline_forecasts(history: pd.Series, horizon: int) -> tuple[np.ndarray, np.ndarray]:
-    values = history.tail(60).to_numpy(dtype=np.float64)
-    x = np.arange(values.size, dtype=np.float64)
-    if values.size >= 2:
-        slope, intercept = np.polyfit(x, values, 1)
-    else:
-        slope, intercept = 0.0, float(values.mean()) if values.size else 0.0
-    future_x = np.arange(values.size, values.size + horizon, dtype=np.float64)
-    ols = np.maximum(intercept + slope * future_x, 0.0)
-
-    poisson = np.full(horizon, max(float(values.mean()) if values.size else 0.0, 0.0))
-    if values.size >= 3 and np.any(values > 0):
-        design = np.column_stack(
-            [x / max(values.size, 1), np.sin(2 * np.pi * x / 7), np.cos(2 * np.pi * x / 7)]
-        )
-        future_design = np.column_stack(
-            [
-                future_x / max(values.size, 1),
-                np.sin(2 * np.pi * future_x / 7),
-                np.cos(2 * np.pi * future_x / 7),
-            ]
-        )
-        estimator = PoissonRegressor(alpha=0.1, max_iter=200)
-        estimator.fit(design, values)
-        poisson = np.maximum(estimator.predict(future_design), 0.0)
-    return ols, poisson
-
-
+@lru_cache(maxsize=1)
 def _portfolio_metrics() -> tuple[dict[str, float | None], str]:
-    metadata_file = METADATA_PATH
-    if MODEL_PATH.is_file() and metadata_file.is_file():
-        with metadata_file.open(encoding="utf-8") as file:
-            metadata = json.load(file)
+    model, metadata = _load_model()
+    if model is not None and metadata is not None:
         metrics = metadata.get("metrics", {})
-        if isinstance(metrics, dict):
+        if _is_daily_artifact(metadata) and isinstance(metrics, dict):
             model_wape = metrics.get("validation_wape")
             model_rmsle = metrics.get("validation_rmsle")
+            ewma_wape = metrics.get("validation_ewma_wape")
+            ewma_rmsle = metrics.get("validation_ewma_rmsle")
+            ridge_wape = metrics.get("validation_ridge_wape")
+            ridge_rmsle = metrics.get("validation_ridge_rmsle")
+            if ewma_wape is None or ewma_rmsle is None or ridge_wape is None or ridge_rmsle is None:
+                data, _ = _load_daily_data()
+                dates = np.sort(data["invoice_date"].dropna().unique())
+                if len(dates) >= 2:
+                    split = min(max(int(np.ceil(len(dates) * 0.8)), 1), len(dates) - 1)
+                    validation_start = dates[split]
+                    ordered = data.sort_values(["item_id", "invoice_date"], kind="mergesort").copy()
+                    training = ordered.loc[ordered["invoice_date"] < validation_start]
+                    validation = ordered.loc[ordered["invoice_date"] >= validation_start].copy()
+                    sku_means = training.groupby("item_id")["quantity"].mean()
+                    fallback_mean = float(training["quantity"].mean()) if not training.empty else 0.0
+                    ewma = ordered.groupby("item_id", sort=False)["quantity"].transform(
+                        lambda values: values.ewm(span=7, adjust=False, min_periods=1).mean().shift(1)
+                    )
+                    ewma_predictions = ewma.loc[validation.index].fillna(validation["item_id"].map(sku_means)).fillna(fallback_mean)
+                    ewma_wape = ewma_wape if ewma_wape is not None else float(compute_wape(validation["quantity"], ewma_predictions))
+                    ewma_rmsle = ewma_rmsle if ewma_rmsle is not None else float(compute_rmsle(validation["quantity"], ewma_predictions))
+
+                    train_items = pd.Categorical(training["item_id"])
+                    valid_items = pd.Categorical(validation["item_id"], categories=train_items.categories)
+                    train_dates = (training["invoice_date"] - training["invoice_date"].min()).dt.days.to_numpy(dtype=float)
+                    valid_dates = (validation["invoice_date"] - training["invoice_date"].min()).dt.days.to_numpy(dtype=float)
+                    ridge = Ridge(alpha=1.0)
+                    ridge.fit(
+                        np.column_stack([train_items.codes, train_dates]),
+                        training["quantity"].to_numpy(dtype=float),
+                    )
+                    ridge_predictions = np.maximum(
+                        ridge.predict(np.column_stack([valid_items.codes, valid_dates])),
+                        0.0,
+                    )
+                    ridge_wape = ridge_wape if ridge_wape is not None else float(compute_wape(validation["quantity"], ridge_predictions))
+                    ridge_rmsle = ridge_rmsle if ridge_rmsle is not None else float(compute_rmsle(validation["quantity"], ridge_predictions))
             return {
                 "wape": float(model_wape) if model_wape is not None else None,
                 "rmsle": float(model_rmsle) if model_rmsle is not None else None,
-            }, "LightGBM chronological validation"
+                "baseline_wape": (
+                    float(metrics["validation_baseline_wape"])
+                    if metrics.get("validation_baseline_wape") is not None
+                    else None
+                ),
+                "baseline_rmsle": (
+                    float(metrics["validation_baseline_rmsle"])
+                    if metrics.get("validation_baseline_rmsle") is not None
+                    else None
+                ),
+                "ewma_wape": float(ewma_wape) if ewma_wape is not None else None,
+                "ewma_rmsle": float(ewma_rmsle) if ewma_rmsle is not None else None,
+                "ridge_wape": float(ridge_wape) if ridge_wape is not None else None,
+                "ridge_rmsle": float(ridge_rmsle) if ridge_rmsle is not None else None,
+            }, "Chronological validation holdout"
 
     data, _ = _load_daily_data()
     dates = np.sort(data["invoice_date"].dropna().unique())
     if len(dates) < 2:
-        return {"wape": None, "rmsle": None}, "Metrics unavailable: insufficient history"
+        return {
+            "wape": None,
+            "rmsle": None,
+            "baseline_wape": None,
+            "baseline_rmsle": None,
+            "ewma_wape": None,
+            "ewma_rmsle": None,
+            "ridge_wape": None,
+            "ridge_rmsle": None,
+        }, "Metrics unavailable: insufficient history"
     split = min(max(int(np.ceil(len(dates) * 0.8)), 1), len(dates) - 1)
     validation_start = dates[split]
     ordered = data.sort_values(["item_id", "invoice_date"], kind="mergesort").copy()
@@ -326,24 +630,63 @@ def _portfolio_metrics() -> tuple[dict[str, float | None], str]:
     sku_means = training.groupby("item_id")["quantity"].mean()
     fallback_mean = float(training["quantity"].mean()) if not training.empty else 0.0
     predictions = validation["seasonal_naive"].fillna(validation["item_id"].map(sku_means)).fillna(fallback_mean)
+    baseline_wape = float(compute_wape(validation["quantity"], predictions))
+    baseline_rmsle = float(compute_rmsle(validation["quantity"], predictions))
+    ewma = ordered.groupby("item_id", sort=False)["quantity"].transform(
+        lambda values: values.ewm(span=7, adjust=False, min_periods=1).mean().shift(1)
+    )
+    ewma_predictions = ewma.loc[validation.index].fillna(validation["item_id"].map(sku_means)).fillna(fallback_mean)
+    ewma_wape = float(compute_wape(validation["quantity"], ewma_predictions))
+    ewma_rmsle = float(compute_rmsle(validation["quantity"], ewma_predictions))
+
+    training = training.sort_index() if hasattr(training, "sort_index") else training
+    train_item_codes = pd.Categorical(training["item_id"]).codes
+    valid_item_codes = pd.Categorical(
+        validation["item_id"],
+        categories=pd.Categorical(training["item_id"]).categories,
+    ).codes
+    train_dates = (training["invoice_date"] - training["invoice_date"].min()).dt.days.to_numpy(dtype=float)
+    valid_dates = (validation["invoice_date"] - training["invoice_date"].min()).dt.days.to_numpy(dtype=float)
+    ridge_features_train = np.column_stack([train_item_codes, train_dates])
+    ridge_features_valid = np.column_stack([valid_item_codes, valid_dates])
+    ridge = Ridge(alpha=1.0)
+    ridge.fit(ridge_features_train, training["quantity"].to_numpy(dtype=float))
+    ridge_predictions = np.maximum(ridge.predict(ridge_features_valid), 0.0)
+    ridge_wape = float(compute_wape(validation["quantity"], ridge_predictions))
+    ridge_rmsle = float(compute_rmsle(validation["quantity"], ridge_predictions))
     return {
-        "wape": float(compute_wape(validation["quantity"], predictions)),
-        "rmsle": float(compute_rmsle(validation["quantity"], predictions)),
-    }, "7-day seasonal-naive live-data holdout"
+        "wape": baseline_wape,
+        "rmsle": baseline_rmsle,
+        "baseline_wape": baseline_wape,
+        "baseline_rmsle": baseline_rmsle,
+        "ewma_wape": ewma_wape,
+        "ewma_rmsle": ewma_rmsle,
+        "ridge_wape": ridge_wape,
+        "ridge_rmsle": ridge_rmsle,
+    }, "7-day naive chronological holdout (baseline only)"
 
 
 @app.get("/api/skus", response_model=SkuResponse)
-def get_skus() -> SkuResponse:
+def get_skus():
+    if _sku_catalog_json is not None:
+        return Response(content=_sku_catalog_json, media_type="application/json")
+    return _build_sku_catalog()
+
+
+def _build_sku_catalog() -> SkuResponse:
     data, source = _load_daily_data()
     grouped = data.groupby("item_id", sort=False).agg(
         total_units=("quantity", "sum"),
-        unit_price=("unit_price", "mean"),
     )
+    observed_prices = data.loc[data["unit_price"] > 0].groupby("item_id")["unit_price"]
+    grouped["unit_price"] = observed_prices.median().reindex(grouped.index).fillna(0.0)
     portfolio_start = data["invoice_date"].min()
     portfolio_end = data["invoice_date"].max()
     calendar_days = max(int((portfolio_end - portfolio_start).days) + 1, 1)
-    counts = data.groupby("item_id")["quantity"].size()
-    grouped["zero_sale_rate"] = 1.0 - counts / calendar_days
+    zero_counts = data.assign(zero_sale=data["quantity"].eq(0)).groupby("item_id")[
+        "zero_sale"
+    ].sum()
+    grouped["zero_sale_rate"] = zero_counts.reindex(grouped.index, fill_value=0) / calendar_days
     grouped["avg_daily_demand"] = grouped["total_units"] / calendar_days
     grouped["revenue"] = data.assign(
         revenue=data["quantity"] * data["unit_price"]
@@ -360,13 +703,43 @@ def get_skus() -> SkuResponse:
             zero_sale_rate=float(grouped["zero_sale_rate"].mean()) if len(grouped) else 0.0,
             data_source=source,
             model_available=model is not None,
+            mode="live_model" if model is not None else "live_baseline",
         ),
         metrics=metrics,
         metrics_source=metrics_source,
         skus=[
             SkuRecord(sku_id=str(sku_id), **row)
-            for sku_id, row in grouped.head(500).round(4).to_dict(orient="index").items()
+            for sku_id, row in grouped.to_dict(orient="index").items()
         ],
+        mode="live_model" if model is not None else "live_baseline",
+    )
+
+
+@app.get("/api/screener", response_model=ScreenerResponse)
+def get_screener(
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=SCREENER_LIMIT, ge=1, le=SCREENER_LIMIT),
+):
+    if _screener_cache is None:
+        catalog = _sku_catalog_cache or _build_sku_catalog()
+        payload = _build_screener_payload(catalog)
+    else:
+        payload = _screener_cache
+    if offset == 0 and limit == SCREENER_LIMIT and _screener_json is not None:
+        return Response(content=_screener_json, media_type="application/json")
+    return ScreenerResponse(
+        total_skus=payload.total_skus,
+        limit=limit,
+        skus=payload.skus[offset : offset + limit],
+    )
+
+
+def _build_screener_payload(catalog: SkuResponse) -> ScreenerResponse:
+    prioritized = sorted(catalog.skus, key=lambda sku: sku.revenue, reverse=True)
+    return ScreenerResponse(
+        total_skus=catalog.portfolio.total_skus,
+        limit=min(SCREENER_LIMIT, len(prioritized)),
+        skus=prioritized[:SCREENER_LIMIT],
     )
 
 
@@ -374,17 +747,30 @@ def get_skus() -> SkuResponse:
 def get_forecast(
     sku_id: str, horizon: int = Query(default=14, ge=1, le=60)
 ) -> ForecastResponse:
+    cache_key = (sku_id, horizon)
+    if _startup_ready and cache_key in _forecast_cache:
+        _forecast_cache.move_to_end(cache_key)
+        return _forecast_cache[cache_key]
     history = _sku_history(sku_id)
     model, metadata = _load_model()
-    ols, poisson = _baseline_forecasts(history["quantity"], horizon)
+    last_week = history["quantity"].tail(7).to_numpy(dtype=np.float64)
+    seasonal_naive = np.asarray(
+        [
+            float(last_week[(step - 1) % len(last_week)]) if len(last_week) else 0.0
+            for step in range(1, horizon + 1)
+        ],
+        dtype=np.float64,
+    )
     if model is not None and metadata is not None:
         prediction = _forecast_with_artifact(sku_id, history, horizon, model, metadata)
-        model_name = "LightGBM Tweedie (p=1.5)"
+        variance_power = metadata.get("tweedie_variance_power")
+        if isinstance(variance_power, (int, float)) and np.isfinite(variance_power):
+            model_name = f"LightGBM Tweedie (p={variance_power:g})"
+        else:
+            model_name = "LightGBM Tweedie"
     else:
-        prediction = poisson.copy()
-        model_name = "Poisson live-data fallback (no trained artifact)"
-    residual_scale = float(history["quantity"].tail(60).std(ddof=0))
-    width = max(residual_scale * 1.2816, 0.0)
+        prediction = seasonal_naive.copy()
+        model_name = "7-day seasonal naive (no trained artifact)"
     future = []
     for index in range(horizon):
         date = history.index[-1] + pd.Timedelta(days=index + 1)
@@ -393,10 +779,7 @@ def get_forecast(
             ForecastPoint(
                 date=date.date().isoformat(),
                 prediction=value,
-                p10=max(value - width, 0.0),
-                p90=value + width,
-                ols=float(ols[index]),
-                poisson=float(poisson[index]),
+                baseline=float(seasonal_naive[index]),
             )
         )
     observed = [
@@ -407,67 +790,146 @@ def get_forecast(
         )
         for date, row in history.tail(60).iterrows()
     ]
-    return ForecastResponse(
+    response = ForecastResponse(
         sku_id=sku_id,
         horizon=horizon,
         model=model_name,
         model_available=model is not None,
         points=observed + future,
+        mode="live_model" if model is not None else "live_baseline",
     )
+    if _startup_ready:
+        _forecast_cache[cache_key] = response
+        if len(_forecast_cache) > 2048:
+            _forecast_cache.popitem(last=False)
+    return response
 
 
 @app.post("/api/optimize-price", response_model=PriceResponse)
 def optimize_sku_price(request: PriceRequest) -> PriceResponse:
-    history = _sku_history(request.sku_id)
-    demand_base = max(float(history["quantity"].tail(28).mean()), 1e-6)
-    observed_prices = history.loc[history["unit_price"] > 0, "unit_price"]
-    base_price = float(observed_prices.tail(60).median()) if not observed_prices.empty else request.unit_cost * 1.5
-    reference_price = base_price * request.competitor_index
-    elasticity = _estimate_elasticity(history)
-    historical_max = max(float(observed_prices.max()) if not observed_prices.empty else reference_price, request.unit_cost * 1.01)
-    engine_result = optimize_price(
-        predicted_demand=demand_base,
-        unit_cost=request.unit_cost,
-        inventory=max(demand_base * 2.0, 1.0),
-        historical_max_price=historical_max,
-        reference_price=reference_price,
-        elasticity=elasticity,
+    cache_key = (
+        request.sku_id,
+        request.unit_cost,
+        request.competitor_index,
+        request.min_margin_floor,
+        request.max_price_delta_pct,
+        request.inventory,
+        request.elasticity,
+        request.strict_bounds,
     )
-    lower_bound = max(request.unit_cost * (1.0 + request.min_margin_floor), reference_price * (1.0 - request.max_price_delta_pct))
-    upper_bound = reference_price * (1.0 + request.max_price_delta_pct)
-    if lower_bound > upper_bound:
-        raise HTTPException(status_code=422, detail="Margin floor exceeds the allowed price-change range.")
+    if _startup_ready and cache_key in _price_response_cache:
+        _price_response_cache.move_to_end(cache_key)
+        return _price_response_cache[cache_key]
+    response = _calculate_sku_price(request)
+    if _startup_ready:
+        _price_response_cache[cache_key] = response
+        if len(_price_response_cache) > 4096:
+            _price_response_cache.popitem(last=False)
+    return response
 
-    grid = np.linspace(lower_bound, upper_bound, 81)
+
+def _calculate_sku_price(request: PriceRequest) -> PriceResponse:
+    history = _sku_history(request.sku_id)
+    demand_base = float(history["quantity"].tail(28).mean())
+    observed_prices = history.loc[history["unit_price"] > 0, "unit_price"]
+    if observed_prices.empty:
+        raise HTTPException(
+            status_code=422,
+            detail="No observed positive prices are available for this SKU.",
+        )
+    base_price = float(observed_prices.tail(60).median())
+    reference_price = base_price * request.competitor_index
+    elasticity = request.elasticity
+    elasticity_source = "user what-if assumption"
+    if elasticity is None:
+        elasticity = _estimate_elasticity(history)
+        elasticity_source = "estimated from observed price-sales history"
+    if elasticity is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Insufficient stable price variation to estimate elasticity; provide an explicit what-if elasticity.",
+        )
+    historical_max = float(observed_prices.max())
+    effective_cost = request.unit_cost
+    effective_margin = request.min_margin_floor
+    upper_bound = min(historical_max, reference_price * (1.0 + request.max_price_delta_pct))
+    if upper_bound <= 0:
+        if request.strict_bounds:
+            raise HTTPException(
+                status_code=422,
+                detail="No feasible price in range. Adjust the cost or price-change bounds.",
+            )
+        upper_bound = max(historical_max, 0.01)
+
+    cost_limited_ceiling = upper_bound / (1.0 + effective_margin)
+    if effective_cost > cost_limited_ceiling:
+        if request.strict_bounds:
+            raise HTTPException(
+                status_code=422,
+                detail="No feasible price in range. Unit cost and margin exceed the available price ceiling.",
+            )
+        effective_cost = cost_limited_ceiling
+
+    lower_bound = max(effective_cost * (1.0 + effective_margin), reference_price * (1.0 - request.max_price_delta_pct))
+    if lower_bound > upper_bound:
+        if request.strict_bounds:
+            raise HTTPException(
+                status_code=422,
+                detail="No feasible price in range. Adjust the margin floor or maximum price change.",
+            )
+        lower_bound = upper_bound
+
+    effective_margin = max(0.0, lower_bound / effective_cost - 1.0) if effective_cost > 0 else 0.0
+    effective_margin = min(effective_margin, 0.999)
+    try:
+        engine_result = optimize_price(
+            predicted_demand=demand_base,
+            unit_cost=effective_cost,
+            inventory=request.inventory,
+            historical_max_price=historical_max,
+            reference_price=reference_price,
+            elasticity=elasticity,
+            min_margin_floor=effective_margin,
+            max_price_delta_pct=request.max_price_delta_pct,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+    def demand_at_price(price: float) -> float:
+        try:
+            return min(
+                demand_curve(demand_base, reference_price, price, elasticity),
+                request.inventory,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    policy_lower = reference_price * (1.0 - request.max_price_delta_pct)
+    policy_upper = reference_price * (1.0 + request.max_price_delta_pct)
+    grid = np.linspace(policy_lower, policy_upper, 81)
     curve = []
     for price in grid:
-        demand = min(
-            demand_curve(demand_base, reference_price, float(price), elasticity),
-            max(demand_base * 2.0, 1.0),
-        )
+        demand = demand_at_price(float(price))
         curve.append(
             ProfitPoint(
                 price=float(price),
                 demand=float(demand),
-                profit=float((price - request.unit_cost) * demand),
-                feasible=True,
+                profit=float((price - effective_cost) * demand),
+                feasible=lower_bound <= price <= upper_bound,
             )
         )
     engine_price = float(engine_result["optimal_price"])
-    candidate_prices = np.append(grid, np.clip(engine_price, lower_bound, upper_bound))
+    curve_mask = np.asarray([point.feasible for point in curve], dtype=bool)
+    candidate_prices = np.append(grid[curve_mask], engine_price)
     profits = [
-        (price - request.unit_cost)
-        * min(demand_curve(demand_base, reference_price, float(price), elasticity), max(demand_base * 2.0, 1.0))
+        (price - request.unit_cost) * demand_at_price(float(price))
         for price in candidate_prices
     ]
     optimal_price = float(candidate_prices[int(np.argmax(profits))])
-    projected_demand = min(
-        demand_curve(demand_base, reference_price, optimal_price, elasticity),
-        max(demand_base * 2.0, 1.0),
-    )
-    optimal_profit = (optimal_price - request.unit_cost) * projected_demand
-    baseline_demand = min(demand_curve(demand_base, reference_price, reference_price, elasticity), max(demand_base * 2.0, 1.0))
-    baseline_profit = (reference_price - request.unit_cost) * baseline_demand
+    projected_demand = demand_at_price(optimal_price)
+    optimal_profit = (optimal_price - effective_cost) * projected_demand
+    baseline_demand = demand_at_price(reference_price)
+    baseline_profit = (reference_price - effective_cost) * baseline_demand
     return PriceResponse(
         sku_id=request.sku_id,
         optimal_price=optimal_price,
@@ -475,61 +937,88 @@ def optimize_sku_price(request: PriceRequest) -> PriceResponse:
         net_profit_uplift=float(optimal_profit - baseline_profit),
         reference_price=float(reference_price),
         profit_curve=curve,
+        inventory_cap=request.inventory,
+        unit_cost=effective_cost,
+        min_margin_floor=effective_margin,
+        historical_max_price=historical_max,
+        max_price_delta_pct=request.max_price_delta_pct,
+        elasticity=elasticity,
+        elasticity_source=elasticity_source,
+        mode="what_if_simulation",
     )
 
 
-def _estimate_elasticity(history: pd.DataFrame) -> float:
+def _estimate_elasticity(history: pd.DataFrame) -> float | None:
     valid = history.loc[(history["quantity"] > 0) & (history["unit_price"] > 0)]
     if len(valid) < 3 or valid["unit_price"].nunique() < 2:
-        return 1.2
+        return None
     elasticity = np.polyfit(np.log(valid["unit_price"]), np.log(valid["quantity"]), 1)[0]
-    return float(np.clip(abs(elasticity), 0.1, 4.0))
+    if not np.isfinite(elasticity) or abs(elasticity) > 10:
+        return None
+    return float(abs(elasticity))
 
 
 @app.get("/api/diagnostics", response_model=DiagnosticsResponse)
 def get_diagnostics() -> DiagnosticsResponse:
-    model, _ = _load_model()
+    if _diagnostics_cache is not None:
+        return _diagnostics_cache
+    model, metadata = _load_model()
     metrics, _ = _portfolio_metrics()
     features: list[FeatureImportance] = []
     if model is not None:
-        importance = evaluate_feature_importance(
-            MODEL_PATH,
-            output_path=MODELS_DIR / "feature_importance.png",
-            top_n=20,
-        )
-        features = [
-            FeatureImportance(feature=str(row.feature), gain=float(row.gain))
-            for row in importance.itertuples(index=False)
-        ]
+        features = _feature_importance_cache or _load_feature_importance(model)
+    variance_power = metadata.get("tweedie_variance_power") if metadata else None
+    objective = (
+        f"Tweedie p={variance_power:g}"
+        if isinstance(variance_power, (int, float)) and np.isfinite(variance_power)
+        else "Tweedie"
+    )
     benchmark_names: list[tuple[str, str]] = [
-        ("LightGBM Tweedie", "Tweedie p=1.5"),
-        ("Poisson GLM", "Poisson deviance"),
-        ("OLS trend", "Squared error"),
-        ("Seasonal naive", "7-day seasonal"),
+        ("LightGBM Tweedie", objective),
+        ("7-day seasonal naive", "Last observed week repeated"),
+        ("7-day EWMA", "Exponentially weighted 7-day demand"),
+        ("Poisson/Ridge regression", "Ridge regression with SKU + date signals"),
     ]
     benchmarks = [
         Benchmark(
             model=name,
             objective=objective,
-            wape=metrics["wape"] if name == "LightGBM Tweedie" and model is not None else None,
-            rmsle=metrics["rmsle"] if name == "LightGBM Tweedie" and model is not None else None,
-            status="trained artifact" if name == "LightGBM Tweedie" and model is not None else (
-                "metrics unavailable" if name == "LightGBM Tweedie" else "benchmark available per SKU"
+            wape=(
+                metrics["wape"] if name == "LightGBM Tweedie" and model is not None
+                else metrics["baseline_wape"] if name == "7-day seasonal naive"
+                else metrics.get("ewma_wape") if name == "7-day EWMA"
+                else metrics.get("ridge_wape") if name == "Poisson/Ridge regression"
+                else None
+            ),
+            rmsle=(
+                metrics["rmsle"] if name == "LightGBM Tweedie" and model is not None
+                else metrics["baseline_rmsle"] if name == "7-day seasonal naive"
+                else metrics.get("ewma_rmsle") if name == "7-day EWMA"
+                else metrics.get("ridge_rmsle") if name == "Poisson/Ridge regression"
+                else None
+            ),
+            status=(
+                "validation holdout model"
+                if name == "LightGBM Tweedie" and model is not None
+                else "same validation holdout baseline"
+                if name == "7-day seasonal naive"
+                else "same validation holdout standalone baseline"
+                if name in {"7-day EWMA", "Poisson/Ridge regression"}
+                else "trained artifact unavailable"
             ),
         )
         for name, objective in benchmark_names
     ]
-    if model is None and (MODEL_PATH.is_file() or METADATA_PATH.is_file()):
-        LOGGER.warning("Incomplete or absent trained model artifacts; attempting pipeline evaluation.")
-        if MODEL_PATH.is_file():
-            try:
-                predict_test_set()
-            except FileNotFoundError as error:
-                LOGGER.warning("Pipeline prediction cannot run without complete artifacts: %s", error)
     return DiagnosticsResponse(
         model_available=model is not None,
         feature_importance=features,
         benchmarks=benchmarks,
         formula="Q(P) = Q_ref × (P_ref / P)^|ε| ; Π(P) = (P − COGS) × min(Q(P), inventory)",
+        mode="live_model" if model is not None else "live_baseline",
+        tweedie_variance_power=(
+            float(variance_power)
+            if isinstance(variance_power, (int, float)) and np.isfinite(variance_power)
+            else None
+        ),
     )
 

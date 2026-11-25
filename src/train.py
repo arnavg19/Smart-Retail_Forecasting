@@ -13,6 +13,9 @@ import joblib
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+from sklearn.linear_model import Ridge
+
+from src.data_loader import normalize_retail_columns
 
 
 LOGGER = logging.getLogger(__name__)
@@ -38,6 +41,10 @@ class TrainingConfig:
     tweedie_variance_power: float = 1.5
     random_state: int = 42
     n_jobs: int = -1
+    item_column: str = "item_id"
+    date_column: str = "invoice_date"
+    target_column: str = "quantity"
+    frequency: str = "D"
 
     def __post_init__(self) -> None:
         if not 0.0 < self.validation_fraction < 1.0:
@@ -110,7 +117,14 @@ def _lightgbm_wape(
     return "wape", wape(y_true, y_pred), False
 
 
-def load_training_data(data_path: str | Path) -> pd.DataFrame:
+def load_training_data(
+    data_path: str | Path,
+    *,
+    item_column: str = "item_id",
+    date_column: str = "invoice_date",
+    target_column: str = "quantity",
+    frequency: str = "D",
+) -> pd.DataFrame:
     """Load and validate the feature-engineered retail demand table.
 
     Invalid dates, missing targets, and missing item IDs are dropped. Negative
@@ -121,16 +135,49 @@ def load_training_data(data_path: str | Path) -> pd.DataFrame:
     if not path.is_file():
         raise FileNotFoundError(f"Feature data not found: {path}")
 
-    data = pd.read_csv(path, dtype={"item_id": "string"}, low_memory=False)
+    data = pd.read_csv(
+        path,
+        dtype={
+            "StockCode": "string",
+            "stockcode": "string",
+            "stock_code": "string",
+            "item_id": "string",
+            item_column: "string",
+        },
+        low_memory=False,
+    )
+    if not any(
+        str(column).strip().lower() in {"unitprice", "unit_price", "price"}
+        for column in data.columns
+    ):
+        data["unit_price"] = 0.0
+    data = normalize_retail_columns(
+        data,
+        item_column=item_column,
+        date_column=date_column,
+        target_column=target_column,
+    )
     required = {"item_id", "invoice_date", "quantity"}
     missing_columns = sorted(required.difference(data.columns))
     if missing_columns:
         raise ValueError(f"Feature data is missing required columns: {missing_columns}")
 
     data["invoice_date"] = pd.to_datetime(data["invoice_date"], errors="coerce")
+    try:
+        data["invoice_date"] = (
+            data["invoice_date"].dt.to_period(frequency).dt.start_time
+        )
+    except ValueError as error:
+        raise ValueError(f"Unsupported training frequency: {frequency!r}") from error
     data["quantity"] = pd.to_numeric(data["quantity"], errors="coerce")
+    data["item_id"] = data["item_id"].astype("string").str.strip()
     valid_target = data["quantity"].notna() & np.isfinite(data["quantity"])
-    valid_rows = data["invoice_date"].notna() & data["item_id"].notna() & valid_target
+    valid_rows = (
+        data["invoice_date"].notna()
+        & data["item_id"].notna()
+        & data["item_id"].str.len().fillna(0).gt(0)
+        & valid_target
+    )
     dropped_rows = int((~valid_rows).sum())
     if dropped_rows:
         LOGGER.warning("Dropping %s rows with missing or invalid IDs, dates, or targets", dropped_rows)
@@ -138,6 +185,10 @@ def load_training_data(data_path: str | Path) -> pd.DataFrame:
 
     if data.empty:
         raise ValueError("No valid training rows remain after data validation.")
+    if data.duplicated(["item_id", "invoice_date"]).any():
+        raise ValueError(
+            "Training data must contain at most one row per item and calendar date."
+        )
     if (data["quantity"] < 0.0).any():
         raise ValueError("Target quantity must be non-negative for Tweedie training.")
 
@@ -156,7 +207,9 @@ def chronological_split(
     if date_column not in data.columns:
         raise ValueError(f"Data must contain a {date_column!r} column.")
 
-    ordered = data.sort_values(date_column, kind="mergesort")
+    ordered = data.copy()
+    ordered[date_column] = pd.to_datetime(ordered[date_column], errors="raise").dt.floor("D")
+    ordered = ordered.sort_values(date_column, kind="mergesort")
     unique_dates = ordered[date_column].drop_duplicates().to_numpy()
     if unique_dates.size < 2:
         raise ValueError("At least two distinct dates are required for a time-series split.")
@@ -263,7 +316,13 @@ def train_model(config: TrainingConfig = TrainingConfig()) -> dict[str, object]:
     dates only. LightGBM trees do not require a scaler, so preprocessing
     details are stored in the metadata artifact instead.
     """
-    data = load_training_data(config.data_path)
+    data = load_training_data(
+        config.data_path,
+        item_column=config.item_column,
+        date_column=config.date_column,
+        target_column=config.target_column,
+        frequency=config.frequency,
+    )
     excluded = {"quantity", "invoice_date", "gross_revenue"}
     feature_columns = [
         column for column in data.columns if column.lower() not in excluded
@@ -313,22 +372,69 @@ def train_model(config: TrainingConfig = TrainingConfig()) -> dict[str, object]:
 
     train_predictions = model.predict(x_train, num_threads=config.n_jobs)
     validation_predictions = model.predict(x_validation, num_threads=config.n_jobs)
+    ordered = data.sort_values(["item_id", "invoice_date"], kind="mergesort").copy()
+    lag_lookup = ordered[["item_id", "invoice_date", "quantity"]].copy()
+    frequency = pd.tseries.frequencies.to_offset(config.frequency).freqstr
+    baseline_periods = 7 if frequency == "D" else 1
+    lag_lookup["invoice_date"] = (
+        lag_lookup["invoice_date"].dt.to_period(frequency) + baseline_periods
+    ).dt.start_time
+    lag_lookup = lag_lookup.rename(columns={"quantity": "baseline_lag_7_days"})
+    validation_lag_values = validation[["item_id", "invoice_date"]].merge(
+        lag_lookup,
+        on=["item_id", "invoice_date"],
+        how="left",
+        sort=False,
+    )["baseline_lag_7_days"]
+    validation_lag = pd.Series(validation_lag_values.to_numpy(), index=validation.index)
+    sku_means = train.groupby("item_id", sort=False)["quantity"].mean()
+    global_mean = float(y_train.mean())
+    baseline_predictions = (
+        validation_lag
+        .fillna(validation["item_id"].map(sku_means))
+        .fillna(global_mean)
+        .to_numpy(dtype=np.float64)
+    )
     metrics = {
         "train_rmsle": rmsle(y_train, train_predictions),
         "train_wape": wape(y_train, train_predictions),
         "validation_rmsle": rmsle(y_validation, validation_predictions),
         "validation_wape": wape(y_validation, validation_predictions),
+        "validation_baseline_rmsle": rmsle(y_validation, baseline_predictions),
+        "validation_baseline_wape": wape(y_validation, baseline_predictions),
     }
+    ewma_column = f"ewma_7d_qty" if "ewma_7d_qty" in validation.columns else f"ewma_7_periods_qty"
+    if ewma_column in validation.columns:
+        ewma_predictions = np.maximum(
+            validation[ewma_column].fillna(0.0).to_numpy(dtype=np.float64),
+            0.0,
+        )
+        metrics["validation_ewma_rmsle"] = rmsle(y_validation, ewma_predictions)
+        metrics["validation_ewma_wape"] = wape(y_validation, ewma_predictions)
+
+    ridge = Ridge(alpha=1.0)
+    ridge.fit(x_train, y_train)
+    ridge_predictions = np.maximum(ridge.predict(x_validation), 0.0)
+    metrics["validation_ridge_rmsle"] = rmsle(y_validation, ridge_predictions)
+    metrics["validation_ridge_wape"] = wape(y_validation, ridge_predictions)
     LOGGER.info(
         "Training scores: RMSLE=%.6f WAPE=%s",
         metrics["train_rmsle"],
         f"{metrics['train_wape']:.6f}" if np.isfinite(metrics["train_wape"]) else "undefined",
     )
     LOGGER.info(
-        "Validation scores: RMSLE=%.6f WAPE=%s",
+        "Validation model scores: RMSLE=%.6f WAPE=%s",
         metrics["validation_rmsle"],
         f"{metrics['validation_wape']:.6f}"
         if np.isfinite(metrics["validation_wape"])
+        else "undefined",
+    )
+    LOGGER.info(
+        "Validation %s naive baseline: RMSLE=%.6f WAPE=%s",
+        "7-day" if frequency == "D" else "previous-period",
+        metrics["validation_baseline_rmsle"],
+        f"{metrics['validation_baseline_wape']:.6f}"
+        if np.isfinite(metrics["validation_baseline_wape"])
         else "undefined",
     )
 
@@ -344,6 +450,15 @@ def train_model(config: TrainingConfig = TrainingConfig()) -> dict[str, object]:
         "tweedie_variance_power": config.tweedie_variance_power,
         "target_column": "quantity",
         "date_column": "invoice_date",
+        "frequency": config.frequency,
+        "validation_baseline_type": (
+            "lag_7_days" if frequency == "D" else f"lag_1_period_{frequency}"
+        ),
+        "source_columns": {
+            "item": config.item_column,
+            "date": config.date_column,
+            "target": config.target_column,
+        },
         "feature_columns": feature_columns,
         "categorical_features": categorical_features,
         "item_id_categories": item_categories,
@@ -382,6 +497,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> TrainingConfig:
     parser.add_argument("--data", type=Path, default=DEFAULT_DATA_PATH, help="Feature CSV path.")
     parser.add_argument("--models-dir", type=Path, default=DEFAULT_MODELS_DIR)
     parser.add_argument("--validation-fraction", type=float, default=0.2)
+    parser.add_argument("--frequency", default="D", help="Pandas calendar frequency for each row.")
     parser.add_argument("--n-estimators", type=int, default=3000)
     parser.add_argument("--early-stopping-rounds", type=int, default=100)
     args = parser.parse_args(argv)
@@ -389,6 +505,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> TrainingConfig:
         data_path=args.data,
         models_dir=args.models_dir,
         validation_fraction=args.validation_fraction,
+        frequency=args.frequency,
         n_estimators=args.n_estimators,
         early_stopping_rounds=args.early_stopping_rounds,
     )

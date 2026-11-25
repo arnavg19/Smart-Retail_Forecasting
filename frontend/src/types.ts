@@ -15,12 +15,25 @@ export type Portfolio = {
   zero_sale_rate: number;
   data_source: string;
   model_available: boolean;
+  mode: string;
 };
 
 export type SkuResponse = {
   portfolio: Portfolio;
-  metrics: { wape: number | null; rmsle: number | null };
+  metrics: {
+    wape: number | null;
+    rmsle: number | null;
+    baseline_wape: number | null;
+    baseline_rmsle: number | null;
+  };
   metrics_source: string;
+  skus: Sku[];
+  mode: string;
+};
+
+export type ScreenerResponse = {
+  total_skus: number;
+  limit: number;
   skus: Sku[];
 };
 
@@ -30,8 +43,7 @@ export type ForecastPoint = {
   prediction?: number | null;
   p10?: number | null;
   p90?: number | null;
-  ols?: number | null;
-  poisson?: number | null;
+  baseline?: number | null;
   zero_sale?: boolean;
 };
 
@@ -41,6 +53,7 @@ export type ForecastResponse = {
   model: string;
   model_available: boolean;
   points: ForecastPoint[];
+  mode: string;
 };
 
 export type PriceInput = {
@@ -49,6 +62,9 @@ export type PriceInput = {
   competitor_index: number;
   min_margin_floor: number;
   max_price_delta_pct: number;
+  inventory: number;
+  elasticity: number;
+  strict_bounds?: boolean;
 };
 
 export type ProfitPoint = {
@@ -65,6 +81,14 @@ export type PriceResponse = {
   net_profit_uplift: number;
   reference_price: number;
   profit_curve: ProfitPoint[];
+  inventory_cap: number;
+  unit_cost: number;
+  min_margin_floor: number;
+  historical_max_price: number;
+  max_price_delta_pct: number;
+  elasticity: number;
+  elasticity_source: string;
+  mode: string;
 };
 
 export type Diagnostics = {
@@ -78,4 +102,25 @@ export type Diagnostics = {
     status: string;
   }[];
   formula: string;
+  mode: string;
+  tweedie_variance_power: number | null;
+};
+
+export type IngestionAudit = {
+  input_rows: number;
+  valid_transaction_rows: number;
+  dropped_invalid_rows: number;
+  active_skus: number;
+  calendar_periods: number;
+  grid_rows: number;
+  zero_sale_rows: number;
+  zero_sale_grid_expansion_rows: number;
+  preview: {
+    item_id: string;
+    invoice_date: string;
+    quantity: number;
+    unit_price: number;
+    gross_revenue: number;
+  }[];
+  mode: string;
 };

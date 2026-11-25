@@ -4,7 +4,7 @@ import argparse
 import json
 import logging
 from pathlib import Path
-from typing import Sequence
+from typing import Sequence, TypedDict
 
 import joblib
 import numpy as np
@@ -20,6 +20,12 @@ DEFAULT_METADATA_PATH = PROJECT_ROOT / "models" / "lightgbm_tweedie_metadata.jso
 DEFAULT_DATA_PATH = PROJECT_ROOT / "data" / "processed" / "test_features.parquet"
 DEFAULT_FALLBACK_DATA_PATH = PROJECT_ROOT / "data" / "processed" / "daily_demand_features.csv"
 DEFAULT_OUTPUT_PATH = PROJECT_ROOT / "models" / "test_predictions.csv"
+
+
+class EvaluationMetrics(TypedDict):
+    rmsle: float
+    wape: float
+    evaluation_split: str
 
 
 def _load_metadata(metadata_path: Path) -> dict[str, object]:
@@ -143,8 +149,8 @@ def predict_test_set(
     metadata_path: str | Path = DEFAULT_METADATA_PATH,
     data_path: str | Path = DEFAULT_DATA_PATH,
     output_path: str | Path = DEFAULT_OUTPUT_PATH,
-) -> tuple[dict[str, float], pd.DataFrame]:
-    """Predict test demand, report RMSLE/WAPE, and save a row-level CSV.
+) -> tuple[EvaluationMetrics, pd.DataFrame]:
+    """Predict test or validation-holdout demand and save a row-level CSV.
 
     The serialized model must be a trusted artifact. Test rows with missing
     IDs, dates, or target values are excluded; negative actual demand is
@@ -245,10 +251,15 @@ def predict_test_set(
     metrics = {
         "rmsle": rmsle(actual, predictions),
         "wape": wape(actual, predictions),
+        "evaluation_split": (
+            "validation_holdout" if using_validation_fallback else "test_set"
+        ),
     }
-    LOGGER.info("Test RMSLE: %.6f", metrics["rmsle"])
+    split_label = "Validation holdout" if using_validation_fallback else "Test set"
+    LOGGER.info("%s RMSLE: %.6f", split_label, metrics["rmsle"])
     LOGGER.info(
-        "Test WAPE: %s",
+        "%s WAPE: %s",
+        split_label,
         f"{metrics['wape']:.6f}" if np.isfinite(metrics["wape"]) else "undefined",
     )
 
@@ -258,17 +269,20 @@ def predict_test_set(
             "stock_code": data["item_id"].astype("string"),
             "actual_quantity": actual,
             "predicted_quantity": predictions,
+            "evaluation_split": metrics["evaluation_split"],
         }
     )
     output_file = Path(output_path)
+    if using_validation_fallback and output_file == DEFAULT_OUTPUT_PATH:
+        output_file = DEFAULT_OUTPUT_PATH.with_name("validation_holdout_predictions.csv")
     output_file.parent.mkdir(parents=True, exist_ok=True)
     prediction_frame.to_csv(output_file, index=False)
-    LOGGER.info("Saved %s test predictions to %s", len(prediction_frame), output_file)
+    LOGGER.info("Saved %s %s predictions to %s", len(prediction_frame), split_label, output_file)
     return metrics, prediction_frame
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run test-set inference from the command line."""
+    """Run test-set inference or explicitly labeled validation fallback."""
     parser = argparse.ArgumentParser(description="Evaluate the trained retail demand model.")
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL_PATH)
     parser.add_argument("--metadata", type=Path, default=DEFAULT_METADATA_PATH)

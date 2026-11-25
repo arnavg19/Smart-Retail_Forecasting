@@ -8,6 +8,8 @@ from typing import Final
 import numpy as np
 import pandas as pd
 
+from src.data_loader import normalize_retail_columns
+
 
 LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
@@ -75,7 +77,9 @@ def add_days_since_last_sale(df: pd.DataFrame) -> pd.DataFrame:
     return features
 
 
-def add_ewma_features(df: pd.DataFrame, span: int = 7) -> pd.DataFrame:
+def add_ewma_features(
+    df: pd.DataFrame, span: int = 7, *, frequency: str = "D"
+) -> pd.DataFrame:
     """Add a per-item, leakage-safe exponentially weighted quantity feature.
 
     Rows are sorted by ``item_id`` and ``invoice_date`` before calculation.
@@ -117,11 +121,14 @@ def add_ewma_features(df: pd.DataFrame, span: int = 7) -> pd.DataFrame:
         .groupby(level=0, sort=False)
         .shift(1)
     )
-    features[f"ewma_{span}d_qty"] = ewma.fillna(0.0).to_numpy()
+    period_label = "d" if frequency == "D" else "_periods"
+    features[f"ewma_{span}{period_label}_qty"] = ewma.fillna(0.0).to_numpy()
     return features
 
 
-def add_safe_discount_feature(df: pd.DataFrame) -> pd.DataFrame:
+def add_safe_discount_feature(
+    df: pd.DataFrame, *, frequency: str = "D"
+) -> pd.DataFrame:
     """Add a leakage-safe 30-observation price average and discount feature.
 
     Rows are sorted by item and date before calculating each item's prior
@@ -177,7 +184,8 @@ def add_safe_discount_feature(df: pd.DataFrame) -> pd.DataFrame:
             0.0,
         )
 
-    features["rolling_30d_avg_unit_price"] = (
+    period_label = "d" if frequency == "D" else "_periods"
+    features[f"rolling_30{period_label}_avg_unit_price"] = (
         rolling_price_mean.replace([np.inf, -np.inf], np.nan).fillna(0.0)
     )
     features["discount_pct"] = np.nan_to_num(
@@ -186,9 +194,65 @@ def add_safe_discount_feature(df: pd.DataFrame) -> pd.DataFrame:
     return features
 
 
-def add_price_discount_feature(df: pd.DataFrame) -> pd.DataFrame:
+def add_price_discount_feature(
+    df: pd.DataFrame, *, frequency: str = "D"
+) -> pd.DataFrame:
     """Backward-compatible alias for :func:`add_safe_discount_feature`."""
-    return add_safe_discount_feature(df)
+    return add_safe_discount_feature(df, frequency=frequency)
+
+
+def add_feature_columns(
+    df: pd.DataFrame,
+    *,
+    item_column: str = "item_id",
+    date_column: str = "invoice_date",
+    target_column: str = "quantity",
+    price_column: str = "unit_price",
+    frequency: str = "D",
+) -> pd.DataFrame:
+    """Normalize common retail headers and create leakage-safe daily features."""
+    data = df.copy()
+    if price_column not in data.columns and not any(
+        str(column).strip().lower() in {"unitprice", "unit_price", "price"}
+        for column in data.columns
+    ):
+        data[price_column] = 0.0
+    data = normalize_retail_columns(
+        data, item_column, date_column, target_column, price_column
+    )
+    features = data.sort_values(["item_id", "invoice_date"], kind="mergesort").copy()
+    features["invoice_date"] = pd.to_datetime(features["invoice_date"], errors="raise")
+    if features["invoice_date"].isna().any() or features["item_id"].isna().any():
+        raise ValueError("Feature data must have non-null item IDs and dates.")
+    if features.duplicated(["item_id", "invoice_date"]).any():
+        raise ValueError("Feature data must contain at most one row per item and date.")
+    features["quantity"] = pd.to_numeric(features["quantity"], errors="raise")
+    features["unit_price"] = pd.to_numeric(features["unit_price"], errors="raise")
+    try:
+        frequency = pd.tseries.frequencies.to_offset(frequency).freqstr
+    except ValueError as error:
+        raise ValueError(f"Unsupported feature frequency: {frequency!r}") from error
+    lag_unit = "days" if frequency == "D" else "periods"
+    rolling_unit = "d" if frequency == "D" else "_periods"
+    features = add_cyclic_calendar_features(features)
+    features = add_days_since_last_sale(features)
+    for lag in (1, 7, 14, 30):
+        features[f"lag_{lag}_{lag_unit}"] = (
+            features.groupby("item_id", sort=False)["quantity"].shift(lag).fillna(0.0)
+        )
+    for window in (7, 30):
+        prior = features.groupby("item_id", sort=False)["quantity"]
+        features[f"rolling_{window}{rolling_unit}_mean_qty"] = prior.transform(
+            lambda series: series.rolling(
+                window=window, min_periods=1, closed="left"
+            ).mean()
+        ).fillna(0.0)
+        features[f"rolling_{window}{rolling_unit}_std_qty"] = prior.transform(
+            lambda series: series.rolling(
+                window=window, min_periods=1, closed="left"
+            ).std(ddof=0)
+        ).fillna(0.0)
+    return features
 
 
 class RetailFeatureEngineer:
@@ -198,28 +262,96 @@ class RetailFeatureEngineer:
     LAG_WINDOWS: Final[list[int]] = [1, 7, 14, 30]
     ROLLING_WINDOWS: Final[list[int]] = [7, 30]
 
-    def __init__(self, data_path: str | Path) -> None:
+    def __init__(
+        self,
+        data_path: str | Path,
+        *,
+        item_column: str = "item_id",
+        date_column: str = "invoice_date",
+        target_column: str = "quantity",
+        price_column: str = "unit_price",
+        frequency: str = "D",
+    ) -> None:
         self.data_path = Path(data_path)
+        self.item_column = item_column
+        self.date_column = date_column
+        self.target_column = target_column
+        self.price_column = price_column
+        try:
+            self.frequency = pd.tseries.frequencies.to_offset(frequency).freqstr
+        except ValueError as error:
+            raise ValueError(f"Unsupported feature frequency: {frequency!r}") from error
+        self.lag_unit = "days" if self.frequency == "D" else "periods"
+        self.rolling_unit = "d" if self.frequency == "D" else "_periods"
+        self.ewma_column = f"ewma_7{self.rolling_unit}_qty"
+        self.price_average_column = f"rolling_30{self.rolling_unit}_avg_unit_price"
         self.data: pd.DataFrame | None = None
 
     def load_data(self) -> pd.DataFrame:
-        """Load the processed daily demand table generated by the data-ingestion pipeline.
-
-        This is the canonical input to all downstream time-series feature engineering. A daily item grid
-        is required so each row represents one item-day, including explicit zero-demand observations.
+        """Load item-period data and construct a complete configured-frequency grid.
         """
         if not self.data_path.exists():
             raise FileNotFoundError(f"Daily demand data not found at: {self.data_path}")
 
-        df = pd.read_csv(self.data_path, dtype={"item_id": "string"})
+        df = pd.read_csv(
+            self.data_path,
+            dtype={
+                "StockCode": "string",
+                "stockcode": "string",
+                "stock_code": "string",
+                "item_id": "string",
+                self.item_column: "string",
+            },
+            low_memory=False,
+        )
+        df = normalize_retail_columns(
+            df,
+            self.item_column,
+            self.date_column,
+            self.target_column,
+            self.price_column,
+        )
         missing = sorted(self.REQUIRED_COLUMNS.difference(df.columns))
         if missing:
             raise ValueError(f"Input dataset is missing required columns: {missing}")
 
-        self.data = df.copy()
+        self.data = df[["item_id", "invoice_date", "quantity", "unit_price"]].copy()
         self.data["invoice_date"] = pd.to_datetime(self.data["invoice_date"], errors="coerce")
-        self.data = self.data.dropna(subset=["invoice_date"]).copy()
-        self.data = self.data.sort_values(["item_id", "invoice_date"]).reset_index(drop=True)
+        self.data["quantity"] = pd.to_numeric(self.data["quantity"], errors="coerce")
+        self.data["unit_price"] = pd.to_numeric(self.data["unit_price"], errors="coerce")
+        self.data = self.data.dropna(
+            subset=["item_id", "invoice_date", "quantity", "unit_price"]
+        ).copy()
+        if self.data.empty:
+            raise ValueError("No valid item-period rows remain after feature-data validation.")
+        try:
+            self.data["invoice_date"] = (
+                self.data["invoice_date"].dt.to_period(self.frequency).dt.start_time
+            )
+        except ValueError as error:
+            raise ValueError(f"Unsupported feature frequency: {self.frequency!r}") from error
+        self.data = (
+            self.data.groupby(["item_id", "invoice_date"], as_index=False, sort=True)
+            .agg(quantity=("quantity", "sum"), unit_price=("unit_price", "mean"))
+        )
+        calendar = pd.period_range(
+            self.data["invoice_date"].min(),
+            self.data["invoice_date"].max(),
+            freq=self.frequency,
+        ).start_time
+        grid = pd.MultiIndex.from_product(
+            [self.data["item_id"].drop_duplicates().sort_values(), calendar],
+            names=["item_id", "invoice_date"],
+        ).to_frame(index=False)
+        self.data = grid.merge(
+            self.data, on=["item_id", "invoice_date"], how="left"
+        )
+        self.data["quantity"] = self.data["quantity"].fillna(0.0)
+        self.data["unit_price"] = (
+            self.data.groupby("item_id", sort=False)["unit_price"]
+            .transform(lambda prices: prices.ffill().fillna(0.0))
+            .fillna(0.0)
+        )
         return self.data
 
     def create_temporal_features(self) -> pd.DataFrame:
@@ -254,7 +386,7 @@ class RetailFeatureEngineer:
 
         features = self.data.copy().sort_values(["item_id", "invoice_date"]).reset_index(drop=True)
         for lag in self.LAG_WINDOWS:
-            features[f"lag_{lag}_days"] = (
+            features[f"lag_{lag}_{self.lag_unit}"] = (
                 features.groupby("item_id")["quantity"]
                 .transform(lambda s: s.shift(lag))
                 .fillna(0.0)
@@ -271,7 +403,7 @@ class RetailFeatureEngineer:
         if self.data is None:
             self.load_data()
 
-        features = add_safe_discount_feature(self.data)
+        features = add_safe_discount_feature(self.data, frequency=self.frequency)
 
         grouped = features.groupby("item_id", sort=True)
         for window in self.ROLLING_WINDOWS:
@@ -288,13 +420,13 @@ class RetailFeatureEngineer:
                 lambda s: s.rolling(window=window, min_periods=1, closed="left").max()
             )
 
-            features[f"rolling_{window}d_mean_qty"] = rolling_stats.fillna(0.0)
-            features[f"rolling_{window}d_std_qty"] = rolling_std.fillna(0.0)
-            features[f"rolling_{window}d_min_qty"] = rolling_min.fillna(0.0)
-            features[f"rolling_{window}d_max_qty"] = rolling_max.fillna(0.0)
+            features[f"rolling_{window}{self.rolling_unit}_mean_qty"] = rolling_stats.fillna(0.0)
+            features[f"rolling_{window}{self.rolling_unit}_std_qty"] = rolling_std.fillna(0.0)
+            features[f"rolling_{window}{self.rolling_unit}_min_qty"] = rolling_min.fillna(0.0)
+            features[f"rolling_{window}{self.rolling_unit}_max_qty"] = rolling_max.fillna(0.0)
 
         features["relative_price_ratio"] = (
-            features["unit_price"] / features["rolling_30d_avg_unit_price"].replace(0, pd.NA)
+            features["unit_price"] / features[self.price_average_column].replace(0, pd.NA)
         ).fillna(1.0)
 
         return features
@@ -314,19 +446,19 @@ class RetailFeatureEngineer:
         base_columns = self.data.columns
         lag_features = self.create_lag_features()
         rolling_features = self.create_rolling_features()
-        ewma_features = add_ewma_features(self.data)
+        ewma_features = add_ewma_features(self.data, frequency=self.frequency)
         combined = combined.join(lag_features.drop(columns=base_columns, errors="ignore"))
         combined = combined.join(rolling_features.drop(columns=base_columns, errors="ignore"))
-        combined = combined.join(ewma_features[["ewma_7d_qty"]])
+        combined = combined.join(ewma_features[[self.ewma_column]])
 
         # Reuse the sorted daily dataset and remove warm-up rows created by lag/rolling windows.
         max_lag = max(self.LAG_WINDOWS)
         max_window = max(self.ROLLING_WINDOWS)
-        warmup_days = max(max_lag, max_window)
+        warmup_periods = max(max_lag, max_window)
 
         combined = combined.sort_values(["item_id", "invoice_date"]).reset_index(drop=True)
         combined["item_day_index"] = combined.groupby("item_id").cumcount()
-        combined = combined[combined["item_day_index"] >= warmup_days].copy()
+        combined = combined[combined["item_day_index"] >= warmup_periods].copy()
         combined = combined.drop(columns=["item_day_index"])
 
         output_cols = [
@@ -345,14 +477,14 @@ class RetailFeatureEngineer:
             "dow_cos",
             "is_weekend",
             "payday_flag",
-            "ewma_7d_qty",
+            self.ewma_column,
             "discount_pct",
-            *[f"lag_{lag}_days" for lag in self.LAG_WINDOWS],
-            *[f"rolling_{window}d_mean_qty" for window in self.ROLLING_WINDOWS],
-            *[f"rolling_{window}d_std_qty" for window in self.ROLLING_WINDOWS],
-            *[f"rolling_{window}d_min_qty" for window in self.ROLLING_WINDOWS],
-            *[f"rolling_{window}d_max_qty" for window in self.ROLLING_WINDOWS],
-            "rolling_30d_avg_unit_price",
+            *[f"lag_{lag}_{self.lag_unit}" for lag in self.LAG_WINDOWS],
+            *[f"rolling_{window}{self.rolling_unit}_mean_qty" for window in self.ROLLING_WINDOWS],
+            *[f"rolling_{window}{self.rolling_unit}_std_qty" for window in self.ROLLING_WINDOWS],
+            *[f"rolling_{window}{self.rolling_unit}_min_qty" for window in self.ROLLING_WINDOWS],
+            *[f"rolling_{window}{self.rolling_unit}_max_qty" for window in self.ROLLING_WINDOWS],
+            self.price_average_column,
             "relative_price_ratio",
         ]
 
