@@ -7,11 +7,19 @@
 *.zip
 
 # Trained models and evaluation outputs
-/models/
+/models/*
 *.joblib
 *.pkl
 *.pickle
 *.png
+!/models/lightgbm_tweedie_model.joblib
+!/models/lightgbm_tweedie_metadata.json
+!/models/feature_importance.json
+
+# Local credentials and environment configuration
+.env
+.env.*
+!.env.example
 
 # Python environments and generated caches
 .venv/

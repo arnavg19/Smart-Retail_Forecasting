@@ -1,0 +1,82 @@
+[
+  {
+    "feature": "rolling_30d_mean_qty",
+    "gain": 38338455.22935867
+  },
+  {
+    "feature": "ewma_7d_qty",
+    "gain": 16066628.596668243
+  },
+  {
+    "feature": "item_id",
+    "gain": 14946514.094654083
+  },
+  {
+    "feature": "unit_price",
+    "gain": 11476024.444824219
+  },
+  {
+    "feature": "dow_sin",
+    "gain": 11020922.598125458
+  },
+  {
+    "feature": "relative_price_ratio",
+    "gain": 6977475.214645386
+  },
+  {
+    "feature": "discount_pct",
+    "gain": 3401936.382331848
+  },
+  {
+    "feature": "day_of_week",
+    "gain": 2731288.5146369934
+  },
+  {
+    "feature": "rolling_30d_std_qty",
+    "gain": 2483452.4557762146
+  },
+  {
+    "feature": "rolling_30d_avg_unit_price",
+    "gain": 2131782.3495635986
+  },
+  {
+    "feature": "rolling_7d_mean_qty",
+    "gain": 1225178.8394584656
+  },
+  {
+    "feature": "month",
+    "gain": 917411.9513816833
+  },
+  {
+    "feature": "day_of_month",
+    "gain": 897282.2103347778
+  },
+  {
+    "feature": "rolling_30d_max_qty",
+    "gain": 594925.9808807373
+  },
+  {
+    "feature": "lag_1_days",
+    "gain": 523932.20222473145
+  },
+  {
+    "feature": "rolling_7d_std_qty",
+    "gain": 374264.92892456055
+  },
+  {
+    "feature": "lag_7_days",
+    "gain": 238921.7547302246
+  },
+  {
+    "feature": "month_sin",
+    "gain": 202845.85005187988
+  },
+  {
+    "feature": "month_cos",
+    "gain": 191961.79962158203
+  },
+  {
+    "feature": "dow_cos",
+    "gain": 133332.6971130371
+  }
+]
