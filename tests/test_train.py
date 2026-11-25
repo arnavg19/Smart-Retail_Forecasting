@@ -44,6 +44,28 @@ def test_chronological_split_separates_validation_dates():
     assert validation["invoice_date"].min() == pd.Timestamp("2024-01-03")
 
 
+def test_chronological_split_keeps_same_calendar_date_together():
+    data = pd.DataFrame(
+        {
+            "invoice_date": pd.to_datetime(
+                [
+                    "2024-01-01 08:00",
+                    "2024-01-01 18:00",
+                    "2024-01-02 09:00",
+                    "2024-01-02 17:00",
+                ]
+            ),
+            "quantity": [1, 2, 3, 4],
+        }
+    )
+
+    train, validation = chronological_split(data, validation_fraction=0.5)
+
+    assert train["invoice_date"].dt.date.nunique() == 1
+    assert validation["invoice_date"].dt.date.nunique() == 1
+    assert train["invoice_date"].max() < validation["invoice_date"].min()
+
+
 def test_train_model_saves_model_and_metadata(tmp_path, monkeypatch):
     dates = pd.date_range("2024-01-01", periods=40, freq="D")
     data = pd.DataFrame(
@@ -87,6 +109,9 @@ def test_train_model_saves_model_and_metadata(tmp_path, monkeypatch):
     assert metadata["objective"] == "tweedie"
     assert metadata["tweedie_variance_power"] == 1.5
     assert metadata["categorical_features"] == ["item_id"]
+    assert metadata["validation_start_date"] > metadata["train_end_date"]
+    assert metadata["metrics"]["validation_baseline_wape"] is not None
+    assert metadata["metrics"]["validation_baseline_rmsle"] is not None
     assert json.loads(metadata_path.read_text(encoding="utf-8"))["train_rows"] == 64
 
     importance_path = models_dir / "feature_importance.png"
@@ -126,13 +151,16 @@ def test_train_model_saves_model_and_metadata(tmp_path, monkeypatch):
 
     assert np.isfinite(metrics["rmsle"])
     assert np.isfinite(metrics["wape"])
+    assert metrics["evaluation_split"] == "test_set"
     assert (predictions["predicted_quantity"] >= 0.0).all()
     assert list(predictions.columns) == [
         "invoice_date",
         "stock_code",
         "actual_quantity",
         "predicted_quantity",
+        "evaluation_split",
     ]
+    assert predictions["evaluation_split"].unique().tolist() == ["test_set"]
     assert predictions_path.is_file()
 
     fallback_path = tmp_path / "daily_demand_features.csv"
@@ -142,7 +170,7 @@ def test_train_model_saves_model_and_metadata(tmp_path, monkeypatch):
     monkeypatch.setattr(predict_module, "DEFAULT_DATA_PATH", missing_parquet_path)
     monkeypatch.setattr(predict_module, "DEFAULT_FALLBACK_DATA_PATH", fallback_path)
 
-    _, fallback_predictions = predict_test_set(
+    fallback_metrics, fallback_predictions = predict_test_set(
         model_path=model_path,
         metadata_path=metadata_path,
         data_path=missing_parquet_path,
@@ -150,6 +178,10 @@ def test_train_model_saves_model_and_metadata(tmp_path, monkeypatch):
     )
 
     assert len(fallback_predictions) == 16
+    assert fallback_metrics["evaluation_split"] == "validation_holdout"
+    assert fallback_predictions["evaluation_split"].unique().tolist() == [
+        "validation_holdout"
+    ]
     assert fallback_predictions["invoice_date"].min() >= pd.Timestamp(
         metadata["validation_start_date"]
     )
