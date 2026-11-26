@@ -71,9 +71,9 @@ const EMPTY_FORECAST_POINTS: ForecastPoint[] = [];
 const EMPTY_PROFIT_CURVE: PriceResponse["profit_curve"] = [];
 
 const money = (value: number, decimals = 2) =>
-  new Intl.NumberFormat("en-US", {
+  new Intl.NumberFormat("en-GB", {
     style: "currency",
-    currency: "USD",
+    currency: "GBP",
     minimumFractionDigits: decimals,
     maximumFractionDigits: decimals,
   }).format(value);
