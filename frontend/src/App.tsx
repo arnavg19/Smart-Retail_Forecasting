@@ -751,6 +751,7 @@ function ExplainabilityView({
 }) {
   const features = diagnostics?.feature_importance ?? [];
   const maxGain = Math.max(...features.map((item) => item.gain), 1);
+  const totalGain = features.reduce((total, item) => total + item.gain, 0);
   return (
     <>
       <div className="view-heading">
@@ -773,7 +774,7 @@ function ExplainabilityView({
                 <span className="feature-rank">{String(index + 1).padStart(2, "0")}</span>
                 <span className="feature-name">{item.feature}</span>
                 <div className="bar-rail"><div style={{ width: `${(item.gain / maxGain) * 100}%` }} className={`gain-bar ${index < 2 ? "gain-primary" : ""}`} /></div>
-                <span className="gain-value">{item.gain.toFixed(1)}%</span>
+                <span className="gain-value">{(totalGain > 0 ? (item.gain / totalGain) * 100 : 0).toFixed(1)}%</span>
               </div>
             ))}
             {!features.length && <div className="empty-note">Feature importance is unavailable until a trained model artifact is present.</div>}
